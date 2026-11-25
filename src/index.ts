@@ -64,8 +64,7 @@ Usage: order-flow-mcp [options]
   --watch BTC,ETH         Start streaming these markets at boot (env ORDERFLOW_WATCH)
   --idle-minutes <n>      Close unwatched markets after n idle minutes (default 30)
   --max-markets <n>       Max concurrent markets (default 20)
-
-Env: FINNHUB_API_KEY enables FX pairs.`);
+`);
       process.exit(0);
     }
   }
