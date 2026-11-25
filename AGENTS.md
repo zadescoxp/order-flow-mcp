@@ -3,7 +3,7 @@
 - `src/lib/` is the order-flow engine and exchange adapters vendored from
   [order-flow-screener](https://github.com/zadescoxp/order-flow-screener). Node-specific changes made here:
   `net.ts` (HTTPS_PROXY + global WebSocket), KuCoin/HTX REST called directly instead of through the app's
-  CORS routes, `FINNHUB_API_KEY`, the vanilla zustand store, `lastDataAt`/`getBooks()`/`getDepthSides()`/
+  CORS routes, forex (Finnhub) removed so the server is crypto-only, the vanilla zustand store, `lastDataAt`/`getBooks()`/`getDepthSides()`/
   `tickSize` on the manager, HTX on its standard (non-AWS) hosts, one-line SDK error logs.
   Keep other engine changes upstream-compatible so fixes can be synced both ways.
 - `src/market.ts`: `LiveMarket` (one per symbol × market type × venue selection, built at 1m; higher
@@ -14,3 +14,5 @@
 - `npm test` runs offline through the engine's replay path; `npm run smoke` hits the real exchanges.
 - `dist/` is committed so `npx github:zadescoxp/order-flow-mcp` works without a build. Run `npm run build`
   before committing source changes; CI fails if `dist/` is stale.
+- `site/` is the static website (plain HTML/CSS/JS, deployed to GitHub Pages by `.github/workflows/pages.yml`).
+  Logo sources and licenses are in `site/assets/CREDITS.md`.

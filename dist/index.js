@@ -56,73 +56,6 @@ var init_net = __esm({
   }
 });
 
-// src/lib/config/venues.ts
-function isForexVenue(venue) {
-  return VENUE_CONFIG[venue]?.assetClass === "forex";
-}
-var forexSymbol, finnhubSymbol, VENUE_CONFIG, FOREX_SYMBOLS, MAJORS, FOREX_GROUPS;
-var init_venues = __esm({
-  "src/lib/config/venues.ts"() {
-    "use strict";
-    forexSymbol = (symbol) => symbol.replace("/", "_").toUpperCase();
-    finnhubSymbol = (symbol) => `OANDA:${forexSymbol(symbol)}`;
-    VENUE_CONFIG = {
-      "binance-futures": void 0,
-      "binance-spot": void 0,
-      "bybit-futures": void 0,
-      "bybit-spot": void 0,
-      "okx-futures": void 0,
-      "okx-spot": void 0,
-      "bitget-futures": void 0,
-      "bitget-spot": void 0,
-      hyperliquid: void 0,
-      deribit: void 0,
-      "coinbase-spot": void 0,
-      "gate-futures": void 0,
-      "gate-spot": void 0,
-      "kucoin-futures": void 0,
-      "kucoin-spot": void 0,
-      "kraken-futures": void 0,
-      "kraken-spot": void 0,
-      "htx-futures": void 0,
-      "htx-spot": void 0,
-      "finnhub-forex": {
-        venue: "finnhub-forex",
-        assetClass: "forex",
-        marketType: "forex",
-        websocketUrl: "wss://ws.finnhub.io",
-        formatSymbol: finnhubSymbol
-      }
-    };
-    FOREX_SYMBOLS = [
-      "EUR/USD",
-      "GBP/USD",
-      "USD/JPY",
-      "USD/CHF",
-      "AUD/USD",
-      "USD/CAD",
-      "NZD/USD",
-      "AUD/JPY",
-      "NZD/JPY",
-      "GBP/CHF",
-      "SGD/CHF",
-      "EUR/NOK",
-      "EUR/TRY",
-      "GBP/HKD",
-      "NZD/HKD",
-      "USD/NOK",
-      "USD/DKK",
-      "USD/SGD",
-      "USD/PLN",
-      "USD/CZK"
-    ];
-    MAJORS = /* @__PURE__ */ new Set(["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD", "NZD/USD"]);
-    FOREX_GROUPS = Object.fromEntries(
-      FOREX_SYMBOLS.map((pair) => [pair, MAJORS.has(pair) ? "Majors" : "Crosses"])
-    );
-  }
-});
-
 // src/lib/config/coinListings.ts
 var COIN_LISTINGS;
 var init_coinListings = __esm({
@@ -349,14 +282,10 @@ var init_instruments = __esm({
 
 // src/lib/adapters/capabilities.ts
 function venueSupports(venue, symbol, marketType) {
-  if (marketType === "forex") {
-    return isForexVenue(venue) && FOREX_SYMBOLS.includes(symbol.replace("_", "/"));
-  }
-  if (isForexVenue(venue)) return false;
   return venuesWithData(symbol, marketType).includes(venue);
 }
 function venuesForSelection(selection, marketType, symbol) {
-  const venues = marketType === "forex" ? FOREX_VENUES : marketType === "perpetual" ? PERP_VENUES : SPOT_VENUES;
+  const venues = marketType === "perpetual" ? PERP_VENUES : SPOT_VENUES;
   if (selection !== "all-perps" && selection !== "all-spot") return [selection];
   return venues.filter((venue) => venueSupports(venue, symbol, marketType));
 }
@@ -367,13 +296,11 @@ function venueForMarket(venue, marketType) {
   const brand = venueBrandOf(venue);
   return (marketType === "perpetual" ? PERP_VENUES : SPOT_VENUES).find((v) => venueBrandOf(v) === brand);
 }
-var FOREX_VENUES, PERP_VENUES, SPOT_VENUES;
+var PERP_VENUES, SPOT_VENUES;
 var init_capabilities = __esm({
   "src/lib/adapters/capabilities.ts"() {
     "use strict";
-    init_venues();
     init_instruments();
-    FOREX_VENUES = ["finnhub-forex"];
     PERP_VENUES = ["binance-futures", "bybit-futures", "okx-futures", "hyperliquid", "bitget-futures", "deribit", "gate-futures", "kucoin-futures", "kraken-futures", "htx-futures"];
     SPOT_VENUES = ["binance-spot", "coinbase-spot", "okx-spot", "bybit-spot", "bitget-spot", "gate-spot", "kucoin-spot", "kraken-spot", "htx-spot"];
   }
@@ -572,100 +499,6 @@ var init_base = __esm({
           error: this.errorMessage,
           stateFlag: this.stateFlag
         };
-      }
-    };
-  }
-});
-
-// src/lib/adapters/forex.ts
-function isForexMarketOpen(date = /* @__PURE__ */ new Date()) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    weekday: "short",
-    hour: "numeric",
-    hour12: false
-  }).formatToParts(date);
-  const weekday = parts.find((part) => part.type === "weekday")?.value;
-  const hour = Number(parts.find((part) => part.type === "hour")?.value);
-  if (weekday === "Sat") return false;
-  if (weekday === "Sun") return hour >= 17;
-  if (weekday === "Fri") return hour < 17;
-  return true;
-}
-var ForexAdapter, finnhubKey, FinnhubForexAdapter;
-var init_forex = __esm({
-  "src/lib/adapters/forex.ts"() {
-    "use strict";
-    init_base();
-    init_venues();
-    ForexAdapter = class extends BaseExchangeAdapter {
-      marketType = "forex";
-      previousPrice = null;
-      previousSide = "buy";
-      flowBias = 0;
-      emitQuote(bid, ask, timestamp = Date.now(), size = 1, id2 = `${this.venue}-${timestamp}`) {
-        if (!isForexMarketOpen(new Date(timestamp))) {
-          this.reportError("MARKET CLOSED \u{1F6AB}", "MARKET CLOSED \u{1F6AB}");
-          return;
-        }
-        if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || ask < bid) return;
-        const price = (bid + ask) / 2;
-        const side = this.previousPrice === null ? this.previousSide : price > this.previousPrice ? "buy" : price < this.previousPrice ? "sell" : this.previousSide;
-        this.previousPrice = price;
-        this.previousSide = side;
-        this.flowBias = Math.max(-0.75, Math.min(0.75, this.flowBias + (side === "buy" ? 0.08 : -0.08)));
-        const quantity = Number.isFinite(size) && size > 0 ? size : 1;
-        const bidLiquidity = quantity * (1 + this.flowBias);
-        const askLiquidity = quantity * (1 - this.flowBias);
-        const trade = {
-          id: id2,
-          venue: this.venue,
-          symbol: this.symbol,
-          timestamp,
-          localTimestamp: Date.now(),
-          price,
-          quantity,
-          quoteVolume: price * quantity,
-          side,
-          marketType: this.marketType
-        };
-        this.emitTrade(trade);
-        const book = {
-          venue: this.venue,
-          symbol: this.symbol,
-          timestamp,
-          localTimestamp: Date.now(),
-          bids: [{ price: bid, size: bidLiquidity, venue: this.venue }],
-          asks: [{ price: ask, size: askLiquidity, venue: this.venue }]
-        };
-        this.emitOrderBook(book);
-      }
-    };
-    finnhubKey = () => process.env.FINNHUB_API_KEY || process.env.NEXT_PUBLIC_FINNHUB_API_KEY;
-    FinnhubForexAdapter = class extends ForexAdapter {
-      venue = "finnhub-forex";
-      buildWsUrl() {
-        const token = finnhubKey();
-        return `${VENUE_CONFIG[this.venue].websocketUrl}?token=${encodeURIComponent(token ?? "")}`;
-      }
-      subscribe() {
-        if (!finnhubKey()) {
-          this.reportError("Missing FINNHUB_API_KEY (set it in the MCP server environment to enable FX)");
-          return;
-        }
-        this.ws?.send(JSON.stringify({ type: "subscribe", symbol: VENUE_CONFIG[this.venue].formatSymbol(this.symbol) }));
-      }
-      handleMessage(raw) {
-        const message = raw;
-        if (message.type !== "trade" || !message.data) return;
-        for (const tick of message.data) {
-          const price = Number(tick.p);
-          const spread = Math.max(price * 5e-5, 1e-5);
-          this.emitQuote(price - spread, price + spread, Number(tick.t), Number(tick.v));
-        }
-      }
-      sendPing() {
-        if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "ping" }));
       }
     };
   }
@@ -2182,8 +2015,6 @@ var init_htx = __esm({
 // src/lib/adapters/exchanges.ts
 function createAdapter(venue, symbol) {
   switch (venue) {
-    case "finnhub-forex":
-      return new FinnhubForexAdapter(symbol);
     case "binance-futures":
       return new BinanceFuturesAdapter(symbol);
     case "bybit-futures":
@@ -2231,7 +2062,6 @@ var init_exchanges = __esm({
   "src/lib/adapters/exchanges.ts"() {
     "use strict";
     init_base();
-    init_forex();
     init_book();
     init_bybit();
     init_okx();
@@ -2651,8 +2481,8 @@ var init_orderFlowEngine = __esm({
 });
 
 // src/lib/engine/analytics.ts
-function secondsPerYear(marketType) {
-  return marketType === "forex" ? SECONDS_PER_YEAR.forex : SECONDS_PER_YEAR.crypto;
+function secondsPerYear(_marketType) {
+  return SECONDS_PER_YEAR.crypto;
 }
 function createFlowBar(time, price, cvd) {
   return {
@@ -2785,9 +2615,9 @@ function applyTradeToSession(stats, price, quantity, side, lagMs) {
   }
   stats.lastTradeLagMs = lagMs;
 }
-function resolveTickSize(price, marketType) {
+function resolveTickSize(price, _marketType) {
   if (!Number.isFinite(price) || price <= 0) return 1;
-  const raw = price * (marketType === "forex" ? 5e-5 : 1e-4);
+  const raw = price * 1e-4;
   const exponent = Math.floor(Math.log10(raw));
   const magnitude = 10 ** exponent;
   const normalized = raw / magnitude;
@@ -2800,9 +2630,7 @@ var init_analytics = __esm({
     "use strict";
     SECONDS_PER_YEAR = {
       // Crypto trades 24/7.
-      crypto: 365 * 86400,
-      // Spot FX trades ~24h × 5 days × 52 weeks.
-      forex: 260 * 86400
+      crypto: 365 * 86400
     };
   }
 });
@@ -3355,7 +3183,7 @@ function venueSummary(series, now2, windowMs = 6e4, leadWindowMs = 15e4, maxLag 
   return { stats, leader: leaders[0] ?? null };
 }
 var VENUE_BUCKET_MS, VENUE_BUCKETS, MIN_LEAD_BUCKETS, VenueTracker;
-var init_venues2 = __esm({
+var init_venues = __esm({
   "src/lib/engine/venues.ts"() {
     "use strict";
     VENUE_BUCKET_MS = 250;
@@ -3409,7 +3237,7 @@ var init_marketDataManager = __esm({
     init_RingBuffer();
     init_depthHistory();
     init_microstructure();
-    init_venues2();
+    init_venues();
     FLOW_BAR_MS = 1e3;
     MAX_GAP_FILL_BARS = 120;
     FLUSH_INTERVAL_MS = 50;
@@ -3999,7 +3827,6 @@ var init_terminalStore = __esm({
     "use strict";
     init_capabilities();
     init_RingBuffer();
-    init_venues();
     MAX_FLOW_BARS = 7200;
     MAX_CANDLES = 500;
     MAX_OBI_POINTS = 600;
@@ -4061,7 +3888,7 @@ var init_terminalStore = __esm({
           })),
           setSelectedVenues: (selectedVenues) => set({ selectedVenues, ...INITIAL_MARKET }),
           setMarketType: (marketType) => set((s) => {
-            if (marketType !== "forex" && s.marketType !== "forex" && marketType !== s.marketType) {
+            if (marketType !== s.marketType) {
               const aggregate = s.venue === "all-perps" || s.venue === "all-spot";
               const venue = aggregate ? marketType === "perpetual" ? "all-perps" : "all-spot" : venueForMarket(s.venue, marketType);
               if (venue) {
@@ -4074,8 +3901,8 @@ var init_terminalStore = __esm({
                 };
               }
             }
-            const isValidVenue = marketType === "forex" ? isForexVenue(s.venue) : marketType === "perpetual" ? s.venue.includes("futures") || s.venue === "hyperliquid" || s.venue === "deribit" || s.venue === "all-perps" : s.venue.includes("spot");
-            const newVenue = isValidVenue ? s.venue : marketType === "forex" ? "finnhub-forex" : marketType === "perpetual" ? "bybit-futures" : "bybit-spot";
+            const isValidVenue = marketType === "perpetual" ? s.venue.includes("futures") || s.venue === "hyperliquid" || s.venue === "deribit" || s.venue === "all-perps" : s.venue.includes("spot");
+            const newVenue = isValidVenue ? s.venue : marketType === "perpetual" ? "bybit-futures" : "bybit-spot";
             return {
               marketType,
               venue: newVenue,
@@ -4141,16 +3968,13 @@ var init_terminalStore = __esm({
 // src/resolve.ts
 function normalizeSymbol(raw) {
   const cleaned = raw.trim().toUpperCase().replace(/[\s_\-/:.]/g, "");
-  const fx = FOREX_SYMBOLS.find((pair) => pair.replace("/", "") === cleaned);
-  if (fx) return { symbol: fx, forex: true };
   let base = cleaned.replace(/(PERPETUAL|PERP|SWAP|SPOT)$/, "").replace(/(USDT|USDC|USD)$/, "");
   if (base === "XBT") base = "BTC";
   if (!base) throw new MarketError(`Cannot read a symbol from "${raw}"`);
-  return { symbol: `${base}USDT`, forex: false };
+  return `${base}USDT`;
 }
 function resolveVenue(raw, marketType) {
   const v = (raw ?? "all").trim().toLowerCase();
-  if (marketType === "forex") return "finnhub-forex";
   if (["all", "aggregate", "aggregated", "all-perps", "all-spot", "*", ""].includes(v)) {
     return marketType === "perpetual" ? "all-perps" : "all-spot";
   }
@@ -4163,17 +3987,15 @@ function resolveVenue(raw, marketType) {
   throw new MarketError(`Unknown ${marketType} venue "${raw}". Use one of: all, ${pool2.join(", ")}`);
 }
 function resolveMarket(rawSymbol, rawVenue, rawMarketType) {
-  const { symbol, forex } = normalizeSymbol(rawSymbol);
-  const mt = (rawMarketType ?? "").toLowerCase();
-  const marketType = forex || mt === "forex" || mt === "fx" ? "forex" : mt === "spot" ? "spot" : "perpetual";
-  if (marketType === "forex" && !forex) throw new MarketError(`${rawSymbol} is not a supported FX pair. Pairs: ${FOREX_SYMBOLS.join(", ")}`);
-  if (marketType !== "forex" && !assetFor(symbol)) {
+  const symbol = normalizeSymbol(rawSymbol);
+  const marketType = (rawMarketType ?? "").toLowerCase() === "spot" ? "spot" : "perpetual";
+  if (!assetFor(symbol)) {
     throw new MarketError(`${symbol} is not in the instrument catalog. Call list_markets to see the ${ALL_ASSETS.length} supported assets.`);
   }
   const selection = resolveVenue(rawVenue, marketType);
   const venues = venuesForSelection(selection, marketType, symbol);
   if (!venues.length || venues.some((venue) => !venueSupports(venue, symbol, marketType))) {
-    const listed = marketType === "forex" ? ["finnhub-forex"] : venuesForSelection(marketType === "perpetual" ? "all-perps" : "all-spot", marketType, symbol);
+    const listed = venuesForSelection(marketType === "perpetual" ? "all-perps" : "all-spot", marketType, symbol);
     throw new MarketError(
       `${selection} has no ${marketType} market for ${symbol}.` + (listed.length ? ` Venues that do: ${listed.join(", ")}` : ` No venue lists a ${marketType} market for it.`)
     );
@@ -4186,7 +4008,6 @@ var init_resolve = __esm({
     "use strict";
     init_capabilities();
     init_instruments();
-    init_venues();
     PERP_VENUES2 = ["binance-futures", "bybit-futures", "okx-futures", "hyperliquid", "bitget-futures", "deribit", "gate-futures", "kucoin-futures", "kraken-futures", "htx-futures"];
     SPOT_VENUES2 = ["binance-spot", "coinbase-spot", "okx-spot", "bybit-spot", "bitget-spot", "gate-spot", "kucoin-spot", "kraken-spot", "htx-spot"];
     TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h"];
@@ -4306,7 +4127,7 @@ var init_market = __esm({
       /** True once trades and a book have arrived. */
       get ready() {
         const s = this.state;
-        return (s.session?.trades ?? 0) > 0 && (s.aggregatedBook !== null || this.spec.marketType === "forex");
+        return (s.session?.trades ?? 0) > 0 && s.aggregatedBook !== null;
       }
       connections() {
         const known = this.state.connections;
@@ -4397,6 +4218,7 @@ var init_market = __esm({
         return true;
       }
       reap() {
+        if (!(this.options.idleMs > 0)) return;
         const now2 = Date.now();
         for (const market of this.list()) {
           if (!market.pinned && now2 - market.lastAccess > this.options.idleMs) this.close(market.spec.key);
@@ -5137,7 +4959,7 @@ var init_views = __esm({
     init_imbalance();
     init_analytics();
     init_derivatives();
-    init_venues2();
+    init_venues();
     pct = (x, decimals = 3) => fixed(x === null || x === void 0 ? null : x * 100, decimals);
   }
 });
@@ -5181,7 +5003,7 @@ function createServer(hub2) {
   const readOnly = { readOnlyHint: true, openWorldHint: true };
   server.registerTool("list_markets", {
     title: "List markets",
-    description: "Supported assets, which exchanges list each as perpetual or spot, FX pairs, and timeframes. Filter with query (e.g. 'sol', 'meme').",
+    description: "Supported crypto assets (plus gold and silver perpetuals), which exchanges list each as perpetual or spot, and timeframes. Filter with query (e.g. 'sol', 'meme').",
     inputSchema: { query: z.string().optional().describe("Case-insensitive filter on ticker or name."), limit: z.number().int().min(1).max(500).optional() },
     annotations: { readOnlyHint: true }
   }, async ({ query, limit }) => {
@@ -5191,8 +5013,6 @@ function createServer(hub2) {
       count: assets.length,
       columns: ["symbol", "name", "kind", "perp_venues", "spot_venues"],
       assets: assets.slice(0, limit ?? 200).map((a) => [`${a.base}USDT`, a.name, a.kind, a.perp.join(","), a.spot.join(",")]),
-      forex_pairs: FOREX_SYMBOLS,
-      forex_note: "FX needs FINNHUB_API_KEY in the server environment; FX quotes have no aggressor side or real depth.",
       perp_venues: PERP_VENUES2,
       spot_venues: SPOT_VENUES2,
       timeframes: TIMEFRAMES
@@ -5459,7 +5279,7 @@ function createServer(hub2) {
     annotations: { readOnlyHint: true }
   }, async () => json({
     max_markets: hub2.options.maxMarkets,
-    idle_close_minutes: hub2.options.idleMs / 6e4,
+    idle_close_minutes: hub2.options.idleMs > 0 ? hub2.options.idleMs / 6e4 : "never",
     markets: hub2.list().map((m) => ({
       symbol: m.spec.symbol,
       market_type: m.spec.marketType,
@@ -5492,7 +5312,6 @@ var init_server = __esm({
   "src/server.ts"() {
     "use strict";
     init_instruments();
-    init_venues();
     init_derivatives();
     init_resolve();
     init_views();
@@ -5505,10 +5324,10 @@ How to use:
 - Use scan_markets to screen several symbols at once.
 - Defaults: market_type="perp" and venue="all" (every venue listing the market, aggregated). Pass venue="bybit" etc. for one exchange, market_type="spot" for spot.
 
-Important: data is live and in-memory. A market starts streaming the first time it is requested, so all session statistics cover only the time since streaming began (see stream_age_s; warming_up=true for the first minute). Call watch_markets early for markets you will analyze later, and wait before drawing conclusions from a young stream. This is market data for analysis only; it cannot place orders.`;
-    symbolArg = z.string().describe('Asset or symbol, e.g. "BTC", "ETHUSDT", "SOL-PERP", or an FX pair like "EUR/USD".');
+Important: data is live and in-memory, and streams continuously while the server runs. The server's watchlist (BTC, ETH and SOL perpetuals by default) streams from startup; any other market starts streaming the first time it is requested and then keeps streaming. Session statistics cover only the time since a market began streaming (see stream_age_s; warming_up=true for the first minute), so wait before drawing conclusions from a young stream. list_active_markets shows what is streaming and for how long; watch_markets pins more markets. This is market data for analysis only; it cannot place orders.`;
+    symbolArg = z.string().describe('Asset or symbol, e.g. "BTC", "ETHUSDT", "SOL-PERP".');
     venueArg = z.string().optional().describe('"all" (default, aggregate every venue listing the market) or one exchange: binance, bybit, okx, bitget, hyperliquid, deribit, coinbase, gate, kucoin, kraken, htx.');
-    marketTypeArg = z.enum(["perp", "perpetual", "spot", "forex"]).optional().describe('"perp" (default), "spot", or "forex".');
+    marketTypeArg = z.enum(["perp", "perpetual", "spot"]).optional().describe('"perp" (default) or "spot".');
     waitArg = z.number().min(0).max(30).optional().describe("Seconds to wait for first data when a market is not streaming yet (default 10).");
     marketArgs = { symbol: symbolArg, venue: venueArg, market_type: marketTypeArg, wait_seconds: waitArg };
   }
@@ -5524,14 +5343,19 @@ console.log = (...args) => console.error(...args);
 console.info = (...args) => console.error(...args);
 var { MarketHub: MarketHub2 } = await Promise.resolve().then(() => (init_market(), market_exports));
 var { createServer: createServer2, VERSION: VERSION2 } = await Promise.resolve().then(() => (init_server(), server_exports));
+var DEFAULT_WATCH = "BTC,ETH,SOL";
+function parseWatch(value) {
+  if (value.trim().toLowerCase() === "none") return [];
+  return value.split(",").map((s) => s.trim()).filter(Boolean);
+}
 function parseArgs(argv) {
   const env2 = process.env;
   const o = {
     http: env2.ORDERFLOW_TRANSPORT === "http",
     port: Number(env2.PORT ?? env2.ORDERFLOW_PORT ?? 3333),
     host: env2.ORDERFLOW_HOST ?? "127.0.0.1",
-    watch: (env2.ORDERFLOW_WATCH ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-    idleMinutes: Number(env2.ORDERFLOW_IDLE_MINUTES ?? 30),
+    watch: parseWatch(env2.ORDERFLOW_WATCH ?? DEFAULT_WATCH),
+    idleMinutes: Number(env2.ORDERFLOW_IDLE_MINUTES ?? 0),
     maxMarkets: Number(env2.ORDERFLOW_MAX_MARKETS ?? 20),
     token: env2.ORDERFLOW_HTTP_TOKEN || void 0
   };
@@ -5542,7 +5366,7 @@ function parseArgs(argv) {
     else if (a === "--stdio") o.http = false;
     else if (a === "--port") o.port = Number(next());
     else if (a === "--host") o.host = next();
-    else if (a === "--watch") o.watch.push(...next().split(",").map((s) => s.trim()).filter(Boolean));
+    else if (a === "--watch") o.watch = parseWatch(next());
     else if (a === "--idle-minutes") o.idleMinutes = Number(next());
     else if (a === "--max-markets") o.maxMarkets = Number(next());
     else if (a === "--token") o.token = next();
@@ -5559,11 +5383,11 @@ Usage: order-flow-mcp [options]
   --port <n>              HTTP port (default 3333, env PORT)
   --host <addr>           HTTP bind address (default 127.0.0.1)
   --token <secret>        Require "Authorization: Bearer <secret>" on HTTP (env ORDERFLOW_HTTP_TOKEN)
-  --watch BTC,ETH         Start streaming these markets at boot (env ORDERFLOW_WATCH)
-  --idle-minutes <n>      Close unwatched markets after n idle minutes (default 30)
+  --watch BTC,ETH         Markets that stream from startup (default BTC,ETH,SOL; "none" to disable;
+                          env ORDERFLOW_WATCH)
+  --idle-minutes <n>      Close unwatched markets after n idle minutes (default 0 = never)
   --max-markets <n>       Max concurrent markets (default 20)
-
-Env: FINNHUB_API_KEY enables FX pairs.`);
+`);
       process.exit(0);
     }
   }
@@ -5578,6 +5402,7 @@ for (const symbol of options.watch) {
     console.error(`[order-flow-mcp] cannot watch ${symbol}: ${error instanceof Error ? error.message : error}`);
   }
 }
+if (options.watch.length) console.error(`[order-flow-mcp] streaming from startup: ${options.watch.join(", ")}`);
 function shutdown() {
   hub.dispose();
   setTimeout(() => process.exit(0), 200).unref();

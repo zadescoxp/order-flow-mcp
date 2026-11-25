@@ -28,14 +28,23 @@ interface Options {
   token?: string;
 }
 
+/** Markets that stream from the moment the server starts, so history is always building. */
+const DEFAULT_WATCH = "BTC,ETH,SOL";
+
+/** "BTC,ETH" → ["BTC", "ETH"]; "none" or "" → []. */
+function parseWatch(value: string): string[] {
+  if (value.trim().toLowerCase() === "none") return [];
+  return value.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 function parseArgs(argv: string[]): Options {
   const env = process.env;
   const o: Options = {
     http: env.ORDERFLOW_TRANSPORT === "http",
     port: Number(env.PORT ?? env.ORDERFLOW_PORT ?? 3333),
     host: env.ORDERFLOW_HOST ?? "127.0.0.1",
-    watch: (env.ORDERFLOW_WATCH ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-    idleMinutes: Number(env.ORDERFLOW_IDLE_MINUTES ?? 30),
+    watch: parseWatch(env.ORDERFLOW_WATCH ?? DEFAULT_WATCH),
+    idleMinutes: Number(env.ORDERFLOW_IDLE_MINUTES ?? 0),
     maxMarkets: Number(env.ORDERFLOW_MAX_MARKETS ?? 20),
     token: env.ORDERFLOW_HTTP_TOKEN || undefined,
   };
@@ -46,7 +55,7 @@ function parseArgs(argv: string[]): Options {
     else if (a === "--stdio") o.http = false;
     else if (a === "--port") o.port = Number(next());
     else if (a === "--host") o.host = next();
-    else if (a === "--watch") o.watch.push(...next().split(",").map((s) => s.trim()).filter(Boolean));
+    else if (a === "--watch") o.watch = parseWatch(next());
     else if (a === "--idle-minutes") o.idleMinutes = Number(next());
     else if (a === "--max-markets") o.maxMarkets = Number(next());
     else if (a === "--token") o.token = next();
@@ -61,11 +70,11 @@ Usage: order-flow-mcp [options]
   --port <n>              HTTP port (default 3333, env PORT)
   --host <addr>           HTTP bind address (default 127.0.0.1)
   --token <secret>        Require "Authorization: Bearer <secret>" on HTTP (env ORDERFLOW_HTTP_TOKEN)
-  --watch BTC,ETH         Start streaming these markets at boot (env ORDERFLOW_WATCH)
-  --idle-minutes <n>      Close unwatched markets after n idle minutes (default 30)
+  --watch BTC,ETH         Markets that stream from startup (default BTC,ETH,SOL; "none" to disable;
+                          env ORDERFLOW_WATCH)
+  --idle-minutes <n>      Close unwatched markets after n idle minutes (default 0 = never)
   --max-markets <n>       Max concurrent markets (default 20)
-
-Env: FINNHUB_API_KEY enables FX pairs.`);
+`);
       process.exit(0);
     }
   }
@@ -82,6 +91,8 @@ for (const symbol of options.watch) {
     console.error(`[order-flow-mcp] cannot watch ${symbol}: ${error instanceof Error ? error.message : error}`);
   }
 }
+
+if (options.watch.length) console.error(`[order-flow-mcp] streaming from startup: ${options.watch.join(", ")}`);
 
 function shutdown() {
   hub.dispose();

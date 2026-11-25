@@ -51,7 +51,7 @@ export class LiveMarket {
   /** True once trades and a book have arrived. */
   get ready(): boolean {
     const s = this.state;
-    return (s.session?.trades ?? 0) > 0 && (s.aggregatedBook !== null || this.spec.marketType === "forex");
+    return (s.session?.trades ?? 0) > 0 && s.aggregatedBook !== null;
   }
 
   connections(): VenueConnection[] {
@@ -164,7 +164,7 @@ export function mergeCandles(openTime: number, durationMs: number, list: Footpri
 }
 
 export interface HubOptions {
-  /** Unpinned markets close after this long without a tool call. */
+  /** Unpinned markets close after this long without a tool call; 0 keeps them streaming. */
   idleMs: number;
   /** Upper bound on concurrently streamed markets. */
   maxMarkets: number;
@@ -213,6 +213,7 @@ export class MarketHub {
   }
 
   private reap(): void {
+    if (!(this.options.idleMs > 0)) return;
     const now = Date.now();
     for (const market of this.list()) {
       if (!market.pinned && now - market.lastAccess > this.options.idleMs) this.close(market.spec.key);

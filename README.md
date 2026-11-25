@@ -9,6 +9,8 @@ venue lead/lag and a multi-symbol screener.
 Works with Claude Code, Codex, Cursor, Claude Desktop, VS Code, Windsurf, Gemini CLI, or any client that speaks MCP.
 You don't need API keys or an account, and there's nothing to configure.
 
+**Website:** [zadescoxp.github.io/order-flow-mcp](https://zadescoxp.github.io/order-flow-mcp/) has a setup guide for each agent.
+
 ```
 you ▸ What's the order flow on BTC right now?
 agent ▸ (calls get_market_snapshot, get_footprint, get_derivatives)
@@ -80,7 +82,7 @@ To run one server that several agents or machines share:
 
 ```bash
 npx -y github:zadescoxp/order-flow-mcp --http --port 3333 --host 0.0.0.0 --token "$SECRET"
-# or: docker build -t order-flow-mcp . && docker run -p 3333:3333 -e ORDERFLOW_HTTP_TOKEN=$SECRET order-flow-mcp
+# or: docker build -t order-flow-mcp . && docker run -d --restart unless-stopped -p 3333:3333 -e ORDERFLOW_HTTP_TOKEN=$SECRET order-flow-mcp
 ```
 
 Then connect a client:
@@ -129,14 +131,14 @@ npm run inspect          # MCP Inspector UI
 | `get_venue_comparison` | Each venue's price premium, volume share and delta, and which exchange leads price (in ms) |
 | `get_liquidity_heatmap` | Resting depth over time within ±1 % of mid, with persistent walls marked pulled, added or held |
 | `scan_markets` | Screener: rank up to 15 symbols by volume z-score, delta, buy %, VWAP stretch, OI change, liquidations… |
-| `watch_markets` / `unwatch_market` / `list_active_markets` | Keep markets streaming in the background so history builds up |
-| `list_markets` | The 120+ supported assets, which venues list each one, FX pairs and timeframes |
+| `watch_markets` / `unwatch_market` / `list_active_markets` | Add markets to the watchlist, stop one, or see what is streaming and for how long |
+| `list_markets` | The 120+ supported assets, which venues list each one, and timeframes |
 
 There is also an `analyze_order_flow` prompt (a slash command in clients that support MCP prompts).
 
 Every market tool takes `symbol` (`"BTC"`, `"eth"`, `"SOL-PERP"`, `"DOGEUSDT"`…), plus optional `venue`
 (default `"all"`, or one of `binance`, `bybit`, `okx`, `bitget`, `hyperliquid`, `deribit`, `coinbase`, `gate`,
-`kucoin`, `kraken`, `htx`) and `market_type` (`perp` by default, `spot`, or `forex`).
+`kucoin`, `kraken`, `htx`) and `market_type` (`perp` by default, or `spot`).
 
 ### Coverage
 
@@ -144,7 +146,7 @@ Every market tool takes `symbol` (`"BTC"`, `"eth"`, `"SOL-PERP"`, `"DOGEUSDT"`�
 | --- | --- |
 | Perpetuals | Binance, Bybit, OKX, Bitget, Hyperliquid, Deribit, Gate, KuCoin, Kraken, HTX |
 | Spot | Binance, Coinbase, OKX, Bybit, Bitget, Gate, KuCoin, Kraken, HTX |
-| Also | Gold and silver (XAU/XAG) perpetuals, and 20 FX pairs (set `FINNHUB_API_KEY`) |
+| Also | Gold and silver (XAU/XAG) perpetuals |
 
 ## How it works
 
@@ -155,15 +157,26 @@ Exchange WebSockets (Siebly SDKs)
   → per-market in-memory session  →  MCP tools (compact JSON)  →  your agent
 ```
 
-The engine is the Order Flow Screener's own code (`src/lib`), running headless in Node. A market starts
-streaming the first time a tool asks for it. Its sockets are shared and it keeps running while it is
-being used. If nothing asks for it for 30 minutes it closes, unless you pinned it with `watch_markets`.
+The engine is the Order Flow Screener's own code (`src/lib`), running headless in Node.
 
-**The data is live and the history is short.** All statistics cover only the time since the server started
-streaming that market. Each response includes `stream_age_s`, and `warming_up` is true for the first minute.
-For an agent that should reason over the last hour, start the market early with `--watch BTC,ETH,SOL` or with
-`watch_markets`. The engine keeps about 8 h of 1-minute footprint candles, 2 h of 1-second flow bars, 2 h of
-depth snapshots and the last 20,000 prints per market.
+### Always live
+
+- **The watchlist streams from startup.** As soon as your agent connects (which starts the server), BTC,
+  ETH and SOL perpetuals start streaming across every venue, before anyone asks a question. Change the
+  list with `--watch` or `ORDERFLOW_WATCH`; `none` turns it off.
+- **Every other market keeps streaming once asked for.** The first request for any other market starts
+  its stream, and it then runs for as long as the server does. Exchange sockets reconnect on their own
+  after drops.
+- **History builds while the server runs.** Statistics cover the time since a market began streaming.
+  Each response includes `stream_age_s`, and `warming_up` is true for the first minute. The engine keeps
+  about 8 h of 1-minute footprint candles, 2 h of 1-second flow bars, 2 h of depth snapshots and the last
+  20,000 prints per market. Older data rolls off, so memory stays bounded (about 250 MB for the default
+  three markets after a few minutes).
+- **For 24/7 history, run it as a service.** A stdio server lives only as long as the agent app that
+  started it, so closing the app ends the stream. To keep data flowing between sessions, run the HTTP
+  server permanently (for example with Docker and `--restart unless-stopped`) and point your agents at it.
+- **Limits:** at most `--max-markets` (default 20) markets stream at once. When a new one is needed past that,
+  the least recently used market that isn't on the watchlist is closed.
 
 Responses are compact JSON, and tables use `columns` + `rows`, so even large footprints stay small in
 the agent's context.
@@ -176,11 +189,10 @@ the agent's context.
 | `--port` | `PORT` | `3333` | HTTP port |
 | `--host` | `ORDERFLOW_HOST` | `127.0.0.1` | HTTP bind address |
 | `--token` | `ORDERFLOW_HTTP_TOKEN` | – | Require `Authorization: Bearer <token>` |
-| `--watch BTC,ETH` | `ORDERFLOW_WATCH` | – | Start and pin markets at boot |
-| `--idle-minutes` | `ORDERFLOW_IDLE_MINUTES` | `30` | Close unpinned markets after this much idle time |
+| `--watch BTC,ETH` | `ORDERFLOW_WATCH` | `BTC,ETH,SOL` | Markets that stream from startup and are never closed; `none` for no watchlist |
+| `--idle-minutes` | `ORDERFLOW_IDLE_MINUTES` | `0` (never) | Close markets outside the watchlist after this much idle time |
 | `--max-markets` | `ORDERFLOW_MAX_MARKETS` | `20` | Upper bound on concurrent markets |
 | | `HTTPS_PROXY` / `ORDERFLOW_PROXY` | – | Send exchange WebSockets and REST calls through an HTTP(S) proxy |
-| | `FINNHUB_API_KEY` | – | Turn on the FX pairs |
 
 To pass env vars from a client config, add `"env": { "ORDERFLOW_WATCH": "BTC,ETH" }` next to `command`.
 
@@ -206,6 +218,10 @@ npm run typecheck
 npm run build        # bundles to dist/index.js (committed so `npx github:` needs no build step)
 npm run smoke        # live end-to-end test of every tool
 ```
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, project layout and guidelines.
 
 ## License
 

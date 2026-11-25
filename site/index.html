@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>orderflow MCP · Live order flow for every AI agent</title>
+  <meta name="description" content="An open-source MCP server that streams live crypto order flow from 10 exchanges to Claude, Codex, Cursor and any AI agent. No API keys, one command.">
+  <meta property="og:title" content="orderflow MCP · Live order flow for every AI agent">
+  <meta property="og:description" content="Footprint, CVD, order books, open interest, liquidations and more, live from 10 exchanges, for any AI agent.">
+  <meta name="theme-color" content="#f5f4f1">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300..700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- Icon sprite (Lucide, ISC license) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-github" viewBox="0 0 16 16"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></symbol>
+    <symbol id="i-gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M12 3v18"/></symbol>
+    <symbol id="i-profile" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h9"/><path d="M3 10h16"/><path d="M3 15h12"/><path d="M3 20h6"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M12 6H5"/><path d="M12 10H3"/><path d="M12 14H7"/><path d="M12 8h6"/><path d="M12 12h9"/><path d="M12 16h5"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17 9 11l4 4 8-8"/><path d="M14 7h7v7"/></symbol>
+    <symbol id="i-whale" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="8"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="M2 12h2"/><path d="M20 12h2"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></symbol>
+    <symbol id="i-ice" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2.7 10.3a2.41 2.41 0 0 0 0 3.41l7.59 7.59a2.41 2.41 0 0 0 3.41 0l7.59-7.59a2.41 2.41 0 0 0 0-3.41l-7.59-7.59a2.41 2.41 0 0 0-3.41 0Z"/></symbol>
+    <symbol id="i-route" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></symbol>
+    <symbol id="i-heat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></symbol>
+    <symbol id="i-radio" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/></symbol>
+  </defs>
+</svg>
+
+<header class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="#top" aria-label="orderflow MCP home">
+      <img src="assets/logo.svg" alt="" width="28" height="28">
+      <span class="brand-name">orderflow<span class="brand-dot">.</span></span>
+      <span class="brand-tag">MCP</span>
+    </a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#connect">Connect</a>
+      <a href="#how">How it works</a>
+      <a href="#tools">Tools</a>
+      <a href="#exchanges">Exchanges</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <div class="nav-cta">
+      <a class="btn btn-ghost btn-sm star-btn" href="https://github.com/zadescoxp/order-flow-mcp" target="_blank" rel="noopener">
+        <svg class="ic"><use href="#i-star"/></svg><span>Star</span><span class="star-count" data-stars hidden></span>
+      </a>
+      <a class="btn btn-dark btn-sm" href="https://github.com/zadescoxp/order-flow-mcp/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">
+        <svg class="ic"><use href="#i-github"/></svg><span>Contribute</span>
+      </a>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- ─── Hero ─────────────────────────────────────────────── -->
+  <section class="hero wrap">
+    <div class="hero-grid" aria-hidden="true"></div>
+    <p class="pill"><span class="live-dot"></span>Live from 10 exchanges · Open source</p>
+    <h1>Live order flow,<br><span class="soft">for every AI agent.</span></h1>
+    <p class="lede">
+      An MCP server that streams trades, order books, open interest and liquidations from the
+      biggest crypto exchanges, so your AI agent can read the market as it moves.
+      No API keys. One command.
+    </p>
+
+    <div class="install" data-copy-wrap>
+      <span class="install-prompt">$</span>
+      <code data-copy-src>claude mcp add orderflow -- npx -y github:zadescoxp/order-flow-mcp</code>
+      <button class="copy" type="button" data-copy aria-label="Copy install command">
+        <svg class="ic"><use href="#i-copy"/></svg><span>Copy</span>
+      </button>
+    </div>
+
+    <div class="hero-actions">
+      <a class="btn btn-dark" href="#connect">Connect your agent <svg class="ic"><use href="#i-arrow"/></svg></a>
+      <a class="btn btn-ghost" href="https://github.com/zadescoxp/order-flow-mcp" target="_blank" rel="noopener">
+        <svg class="ic"><use href="#i-github"/></svg> View on GitHub
+      </a>
+    </div>
+
+    <div class="works-with">
+      <span>Works with</span>
+      <ul>
+        <li title="Claude Code"><img src="assets/agents/claude-code.svg" alt="Claude Code"></li>
+        <li title="Codex"><img src="assets/agents/codex.svg" alt="Codex"></li>
+        <li title="Claude Desktop"><img src="assets/agents/claude.svg" alt="Claude Desktop"></li>
+        <li title="Cursor"><img src="assets/agents/cursor.svg" alt="Cursor"></li>
+        <li title="VS Code · GitHub Copilot"><img src="assets/agents/copilot.svg" alt="GitHub Copilot"></li>
+        <li title="Windsurf"><img src="assets/agents/windsurf.svg" alt="Windsurf"></li>
+        <li title="Gemini CLI"><img src="assets/agents/gemini.svg" alt="Gemini CLI"></li>
+        <li title="Cline"><img src="assets/agents/cline.svg" alt="Cline"></li>
+      </ul>
+    </div>
+
+    <!-- Demo: what an agent sees -->
+    <div class="demo" aria-label="Example conversation">
+      <div class="demo-chat">
+        <div class="demo-bar"><span></span><span></span><span></span><em>Claude Code</em></div>
+        <div class="msg user">What's the order flow on BTC right now?</div>
+        <div class="calls">
+          <span class="call"><svg class="ic"><use href="#i-plug"/></svg>get_market_snapshot</span>
+          <span class="call"><svg class="ic"><use href="#i-plug"/></svg>get_footprint</span>
+          <span class="call"><svg class="ic"><use href="#i-plug"/></svg>get_derivatives</span>
+        </div>
+        <div class="msg bot">
+          <p><b>BTC 59,197</b>, 1.3σ above session VWAP and above value (VAH 59,110).</p>
+          <p><span class="up">Buyers took 76%</span> of the last 5 minutes, but an <b>iceberg offer at 59,098</b> absorbed the push before it broke.</p>
+          <p>OI flat, funding +0.003%/8h. <span class="muted">10/10 venues live.</span></p>
+        </div>
+      </div>
+      <div class="demo-fp" aria-label="Footprint candle">
+        <div class="fp-head"><span>BTC · 1m footprint</span><span class="fp-live"><span class="live-dot"></span>live</span></div>
+        <div class="fp-cols"><span>bid × ask</span><span>delta</span></div>
+        <ul class="fp" data-footprint></ul>
+        <div class="fp-foot"><span>POC <b>59,170</b></span><span>Δ <b class="up">+146</b></span><span>CVD <b class="up">+312</b></span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── Stats ───────────────────────────────────────────── -->
+  <section class="wrap">
+    <div class="stats">
+      <div class="stat"><div class="num">10</div><p>exchanges streamed live, with 10 perpetual and 9 spot markets normalized and merged into one view.</p></div>
+      <div class="stat is-default"><div class="num">17</div><p>tools: footprint, CVD, profile, books, OI, funding, liquidations, icebergs and more.</p></div>
+      <div class="stat"><div class="num">124</div><p>crypto assets, from BTC and ETH to the long tail, plus gold and silver perps.</p></div>
+      <div class="stat"><div class="num">0</div><p>API keys or exchange accounts needed. Public market data only.</p></div>
+    </div>
+  </section>
+
+  <!-- ─── Connect ─────────────────────────────────────────── -->
+  <section class="section wrap" id="connect">
+    <div class="section-head">
+      <p class="eyebrow"><svg class="ic"><use href="#i-plug"/></svg>Connect</p>
+      <h2>Plug it into your agent<br><span class="soft">in about 30 seconds.</span></h2>
+      <p class="sub">Pick your agent, copy one line, and you're done. You only need <a href="https://nodejs.org" target="_blank" rel="noopener">Node.js 20+</a> installed.</p>
+    </div>
+
+    <div class="connect">
+      <div class="agents" role="tablist" aria-label="Choose your agent" data-agents></div>
+      <div class="agent-panel" role="tabpanel" data-panel>
+        <div class="panel-top">
+          <img data-panel-logo src="assets/agents/claude-code.svg" alt="" width="36" height="36">
+          <div>
+            <h3 data-panel-name>Claude Code</h3>
+            <p data-panel-where class="muted">Run this in your terminal</p>
+          </div>
+        </div>
+        <ol class="steps">
+          <li>
+            <span class="step-n">1</span>
+            <div class="step-body">
+              <p data-panel-step1>Add the server</p>
+              <div class="code" data-copy-wrap>
+                <pre><code data-copy-src data-panel-code></code></pre>
+                <button class="copy" type="button" data-copy aria-label="Copy"><svg class="ic"><use href="#i-copy"/></svg><span>Copy</span></button>
+              </div>
+            </div>
+          </li>
+          <li>
+            <span class="step-n">2</span>
+            <div class="step-body"><p data-panel-step2>Restart your agent so it picks up the new server.</p></div>
+          </li>
+          <li>
+            <span class="step-n">3</span>
+            <div class="step-body"><p>Ask something like <q>Give me a live order-flow read on BTC.</q></p></div>
+          </li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── How it works ────────────────────────────────────── -->
+  <section class="section wrap" id="how">
+    <div class="section-head">
+      <p class="eyebrow"><svg class="ic"><use href="#i-route"/></svg>How it works</p>
+      <h2>Three steps.<br><span class="soft">Nothing to babysit.</span></h2>
+    </div>
+    <div class="how">
+      <article class="how-card">
+        <span class="how-n">01.</span>
+        <div>
+          <svg class="ic ic-tile"><use href="#i-plug"/></svg>
+          <h3>Connect</h3>
+          <p>Add one line to your agent's MCP settings. It starts the server for you.</p>
+        </div>
+      </article>
+      <article class="how-card how-feature">
+        <div class="how-art" aria-hidden="true">
+          <svg viewBox="0 0 400 160" preserveAspectRatio="none" data-waves></svg>
+        </div>
+        <div>
+          <svg class="ic ic-tile"><use href="#i-radio"/></svg>
+          <h3>It stays live</h3>
+          <p>The server opens live feeds to 10 exchanges and keeps them streaming. BTC, ETH and SOL start the moment it connects; any coin you ask about joins and keeps running.</p>
+        </div>
+      </article>
+      <article class="how-card">
+        <span class="how-n">03.</span>
+        <div>
+          <svg class="ic ic-tile"><use href="#i-chat"/></svg>
+          <h3>Ask anything</h3>
+          <p>Your agent calls the right tools and answers with real, current numbers.</p>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ─── Tools ───────────────────────────────────────────── -->
+  <section class="section wrap" id="tools">
+    <div class="section-head">
+      <p class="eyebrow"><svg class="ic"><use href="#i-layers"/></svg>Tools</p>
+      <h2>Everything a trader reads,<br><span class="soft">now readable by your agent.</span></h2>
+      <p class="sub">The same engine as the <a href="https://github.com/zadescoxp/order-flow-screener" target="_blank" rel="noopener">Order Flow Screener</a>, returned as compact JSON your agent understands.</p>
+    </div>
+    <div class="tools">
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-gauge"/></svg><h3>Market snapshot</h3><p>Price, VWAP, delta, value area, book imbalance, OI, funding and plain-English signals in one call.</p><q>How is BTC trading?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-grid"/></svg><h3>Footprint</h3><p>Bid × ask volume at every price, 1m to 4h, with imbalances and stacked imbalances.</p><q>Show the last 5m candles.</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-profile"/></svg><h3>Volume profile</h3><p>Point of control, value area high and low, and the heaviest traded prices.</p><q>Where is the POC?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-book"/></svg><h3>Order book &amp; walls</h3><p>Depth merged across exchanges, liquidity bands and the biggest resting orders.</p><q>Any big walls above?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-wave"/></svg><h3>CVD &amp; flow</h3><p>Cumulative volume delta, buy vs sell volume and volume spikes, bar by bar.</p><q>Is CVD diverging?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-whale"/></svg><h3>Big prints</h3><p>Whale-sized trades, many times the average size, with buy and sell totals.</p><q>Any whales buying?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-layers"/></svg><h3>Open interest &amp; funding</h3><p>OI and funding per exchange, plus who's driving the move: new longs, short covering…</p><q>Are shorts covering?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-zap"/></svg><h3>Liquidations</h3><p>Longs vs shorts wiped out, minute by minute, with a cascade alert.</p><q>Any liquidation cascade?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-ice"/></svg><h3>Absorption &amp; icebergs</h3><p>Spots where passive orders soak up aggressive flow, and hidden size that keeps refilling.</p><q>Is 59k being defended?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-route"/></svg><h3>Exchange lead / lag</h3><p>Which exchange moves first, price premiums and each venue's share of volume.</p><q>Who's leading price?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-heat"/></svg><h3>Liquidity heatmap</h3><p>Resting liquidity over time, and whether big walls were pulled or held.</p><q>Was that wall pulled?</q></article>
+      <article class="tool"><svg class="ic ic-tile"><use href="#i-search"/></svg><h3>Screener</h3><p>Rank up to 15 coins by volume spikes, delta, VWAP stretch, OI change and liquidations.</p><q>What's moving right now?</q></article>
+    </div>
+  </section>
+
+  <!-- ─── Exchanges ──────────────────────────────────────── -->
+  <section class="section wrap" id="exchanges">
+    <p class="eyebrow center">Streaming live from</p>
+    <ul class="exchanges">
+      <li><img src="assets/exchanges/binance.svg" alt=""><span>Binance</span></li>
+      <li><img src="assets/exchanges/bybit.svg" alt=""><span>Bybit</span></li>
+      <li><img src="assets/exchanges/okx.svg" alt=""><span>OKX</span></li>
+      <li><img src="assets/exchanges/coinbase.svg" alt=""><span>Coinbase</span></li>
+      <li><img src="assets/exchanges/bitget.svg" alt=""><span>Bitget</span></li>
+      <li><img src="assets/exchanges/hyperliquid.svg" alt=""><span>Hyperliquid</span></li>
+      <li><img src="assets/exchanges/deribit.svg" alt=""><span>Deribit</span></li>
+      <li><img src="assets/exchanges/kraken.svg" alt=""><span>Kraken</span></li>
+      <li><img src="assets/exchanges/gate.svg" alt=""><span>Gate</span></li>
+      <li><img src="assets/exchanges/kucoin.svg" alt=""><span>KuCoin</span></li>
+      <li><img src="assets/exchanges/htx.svg" alt=""><span>HTX</span></li>
+    </ul>
+  </section>
+
+  <!-- ─── FAQ ─────────────────────────────────────────────── -->
+  <section class="section wrap" id="faq">
+    <div class="faq-grid">
+      <div class="section-head">
+        <p class="eyebrow"><svg class="ic"><use href="#i-chat"/></svg>FAQ</p>
+        <h2>Questions,<br><span class="soft">answered.</span></h2>
+      </div>
+      <div class="faq">
+        <details open>
+          <summary>Is it free?<svg class="ic"><use href="#i-plus"/></svg></summary>
+          <p>Yes. It's open source under the Apache-2.0 license, and the market data comes from public exchange feeds.</p>
+        </details>
+        <details>
+          <summary>Do I need API keys or exchange accounts?<svg class="ic"><use href="#i-plus"/></svg></summary>
+          <p>No. It only reads public market data, so there's nothing to sign up for and no keys to manage.</p>
+        </details>
+        <details>
+          <summary>Is the data really live?<svg class="ic"><use href="#i-plus"/></svg></summary>
+          <p>Yes. As long as the server is running it streams continuously. BTC, ETH and SOL start the moment your agent connects, and any other coin starts the first time you ask about it, then keeps streaming. History builds from that point: up to 8 hours of 1-minute footprint candles.</p>
+        </details>
+        <details>
+          <summary>How do I keep history running 24/7?<svg class="ic"><use href="#i-plus"/></svg></summary>
+          <p>When your agent app closes, the server it started closes too. To keep collecting around the clock, run it as a service with <code>--http</code> (or the Docker image) on any machine and point your agents at <code>http://your-host:3333/mcp</code>.</p>
+        </details>
+        <details>
+          <summary>Which coins are supported?<svg class="ic"><use href="#i-plus"/></svg></summary>
+          <p>124 crypto assets on perpetuals and spot, plus gold and silver perpetuals. Just say “BTC”, “eth”, or “SOL-PERP”; your agent can ask the server for the full list.</p>
+        </details>
+        <details>
+          <summary>Can it place trades?<svg class="ic"><use href="#i-plus"/></svg></summary>
+          <p>No. It's read-only market data for analysis. Nothing it returns is financial advice.</p>
+        </details>
+        <details>
+          <summary>An exchange shows “connecting”. What's wrong?<svg class="ic"><use href="#i-plus"/></svg></summary>
+          <p>Some exchanges block certain countries (Binance refuses US connections, for example). The other exchanges keep working, and the response tells your agent which venues are live. Corporate proxies work too: set <code>HTTPS_PROXY</code>.</p>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── Contribute ─────────────────────────────────────── -->
+  <section class="wrap">
+    <div class="cta">
+      <div class="cta-glow" aria-hidden="true"></div>
+      <p class="eyebrow light"><svg class="ic"><use href="#i-github"/></svg>Open source</p>
+      <h2>Built in the open.<br>Help make it better.</h2>
+      <p>New exchanges, new tools, sharper signals, better docs. Every contribution counts.</p>
+      <div class="cta-actions">
+        <a class="btn btn-dark" href="https://github.com/zadescoxp/order-flow-mcp/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">
+          <svg class="ic"><use href="#i-github"/></svg> Contribute on GitHub
+        </a>
+        <a class="btn btn-light" href="https://github.com/zadescoxp/order-flow-mcp" target="_blank" rel="noopener">
+          <svg class="ic"><use href="#i-star"/></svg> Star the repo
+        </a>
+        <a class="btn btn-light" href="https://github.com/zadescoxp/order-flow-mcp/issues/new" target="_blank" rel="noopener">Report an issue</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer wrap">
+  <div class="foot-brand">
+    <img src="assets/logo.svg" alt="" width="24" height="24">
+    <span>orderflow<span class="brand-dot">.</span> MCP</span>
+  </div>
+  <nav class="foot-links" aria-label="Footer">
+    <a href="https://github.com/zadescoxp/order-flow-mcp" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://github.com/zadescoxp/order-flow-mcp#readme" target="_blank" rel="noopener">Docs</a>
+    <a href="https://github.com/zadescoxp/order-flow-screener" target="_blank" rel="noopener">Order Flow Screener</a>
+    <a href="https://github.com/zadescoxp/order-flow-mcp/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
+  </nav>
+  <p class="foot-note">Market data via the <a href="https://siebly.io" target="_blank" rel="noopener">Siebly</a> exchange SDKs. For analysis only, not financial advice. Product names and logos belong to their owners.</p>
+</footer>
+
+<script src="app.js" defer></script>
+</body>
+</html>
