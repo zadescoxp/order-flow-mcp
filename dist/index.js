@@ -4498,6 +4498,27 @@ function connectionsView(market) {
     };
   });
 }
+function referenceLast(market) {
+  const tape = market.manager.getTapeLog();
+  if (!tape.length) return null;
+  const wanted = market.spec.venues.length;
+  const cutoff = tape[0].timestamp - 6e4;
+  const latest = /* @__PURE__ */ new Map();
+  for (const t of tape) {
+    if (t.timestamp < cutoff || latest.size >= wanted) break;
+    if (!latest.has(t.venue)) latest.set(t.venue, t.price);
+  }
+  const prices = [...latest.values()].sort((a, b) => a - b);
+  const m = prices.length >> 1;
+  const price = prices.length % 2 ? prices[m] : (prices[m - 1] + prices[m]) / 2;
+  return { price, print: tape[0].price, printVenue: tape[0].venue, venues: prices.length };
+}
+function sigmaFromVwapOf(market) {
+  const session = market.state.session;
+  const ref = referenceLast(market);
+  if (!session || !ref || !(session.vwapStd > 0)) return null;
+  return (ref.price - session.vwap) / session.vwapStd;
+}
 function referenceQuote(market) {
   const books = [...market.manager.getBooks().values()].filter((b) => b.bids[0] && b.asks[0]);
   if (!books.length) return null;
@@ -4609,9 +4630,10 @@ function snapshotView(market) {
   const book = s.aggregatedBook;
   const quote = referenceQuote(market);
   const profile = s.volumeProfile;
-  const last = session?.last ?? s.ticker?.price ?? null;
+  const ref = referenceLast(market);
+  const last = ref?.price ?? session?.last ?? s.ticker?.price ?? null;
   const t = now(market);
-  const sigmaFromVwap = session && session.vwapStd > 0 ? (session.last - session.vwap) / session.vwapStd : null;
+  const sigmaFromVwap = sigmaFromVwapOf(market);
   const valueLocation = profile && last ? last > profile.vah ? "above_value_area" : last < profile.val ? "below_value_area" : "inside_value_area" : null;
   const deriv = s.derivatives;
   const oi5 = oiWindowChange(s.oiHistory, 5 * 6e4);
@@ -4653,6 +4675,7 @@ function snapshotView(market) {
     ...header(market),
     price: {
       last: p(last),
+      ...ref && market.spec.venues.length > 1 ? { last_note: `median of ${ref.venues} venues' latest prints`, last_print: p(ref.print), last_print_venue: ref.printVenue } : {},
       mid: p(quote?.mid),
       spread_bps: fixed(quote?.spread_bps, 2),
       ...quote && quote.venues > 1 ? {
@@ -4665,7 +4688,7 @@ function snapshotView(market) {
       open: p(session.open),
       high: p(session.high),
       low: p(session.low),
-      change_pct: session.open ? pct((session.last - session.open) / session.open) : null,
+      change_pct: session.open && last ? pct((last - session.open) / session.open) : null,
       vwap: p(session.vwap),
       vwap_std: p(session.vwapStd),
       sigma_from_vwap: fixed(sigmaFromVwap, 2),
@@ -5049,7 +5072,7 @@ function heatmapView(market, minutes, rows, columns) {
   const to = h.lastSeq;
   if (to < from || h.size === 0) return { ...header(market), heatmap: null, note: "No depth snapshots yet (sampled once a second once trades and books arrive)." };
   const tick = h.tick;
-  const mid = referenceQuote(market)?.mid || market.state.session?.last || 0;
+  const mid = referenceQuote(market)?.mid || referenceLast(market)?.price || 0;
   const band = 0.01;
   const lo = mid * (1 - band), hi = mid * (1 + band);
   const ticksPerRow = Math.max(1, Math.ceil((hi - lo) / tick / rows));
@@ -5331,7 +5354,7 @@ function createServer(hub2) {
       const t = s.marketClock || Date.now();
       const w5 = flowWindow(m, 5 * 6e4);
       const session = s.session;
-      const sigma = session && session.vwapStd > 0 ? (session.last - session.vwap) / session.vwapStd : null;
+      const sigma = sigmaFromVwapOf(m);
       const bars = s.flowBars;
       let volumeZ = null;
       if (bars.length > 120) {
@@ -5352,7 +5375,7 @@ function createServer(hub2) {
         symbol: m.spec.symbol,
         ready: m.ready,
         stream_age_s: Math.round(m.ageMs / 1e3),
-        last: session?.last ?? null,
+        last: sig(referenceLast(m)?.price, 8),
         change_5m_pct: w5?.price_change_pct ?? null,
         delta_5m: w5?.delta ?? null,
         buy_pct_5m: w5?.buy_pct ?? null,
@@ -5445,7 +5468,7 @@ function createServer(hub2) {
       stream_age_s: Math.round(m.ageMs / 1e3),
       idle_s: Math.round((Date.now() - m.lastAccess) / 1e3),
       trades: m.state.session?.trades ?? 0,
-      last: m.state.session?.last ?? null,
+      last: sig(referenceLast(m)?.price, 8),
       connections: connectionsView(m)
     }))
   }));
