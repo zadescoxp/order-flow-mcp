@@ -9,6 +9,8 @@ venue lead/lag and a multi-symbol screener.
 Works with Claude Code, Codex, Cursor, Claude Desktop, VS Code, Windsurf, Gemini CLI, or any client that speaks MCP.
 You don't need API keys or an account, and there's nothing to configure.
 
+**Website:** [zadescoxp.github.io/order-flow-mcp](https://zadescoxp.github.io/order-flow-mcp/) has a setup guide for each agent.
+
 ```
 you ▸ What's the order flow on BTC right now?
 agent ▸ (calls get_market_snapshot, get_footprint, get_derivatives)
@@ -216,6 +218,10 @@ npm run typecheck
 npm run build        # bundles to dist/index.js (committed so `npx github:` needs no build step)
 npm run smoke        # live end-to-end test of every tool
 ```
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, project layout and guidelines.
 
 ## License
 
