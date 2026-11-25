@@ -280,6 +280,2095 @@ var init_instruments = __esm({
   }
 });
 
+// src/lib/engine/orderFlowEngine.ts
+function getCandleOpenTime(timestamp, timeframe) {
+  const ms = TIMEFRAME_MS[timeframe];
+  return Math.floor(timestamp / ms) * ms;
+}
+function roundToTick(price, tickSize) {
+  if (!Number.isFinite(price) || tickSize <= 0) return price;
+  const index = Math.round(price / tickSize);
+  const decimals = getTickDecimals(tickSize);
+  return Number((index * tickSize).toFixed(decimals + 2));
+}
+function getTickDecimals(tickSize) {
+  if (!Number.isFinite(tickSize) || tickSize <= 0) return 0;
+  for (let decimals = 0; decimals <= 10; decimals++) {
+    const scaled = tickSize * 10 ** decimals;
+    if (Math.abs(scaled - Math.round(scaled)) < 1e-9 * Math.max(1, scaled)) return decimals;
+  }
+  return 10;
+}
+function createEmptyCandle(openTime, timeframe) {
+  const ms = TIMEFRAME_MS[timeframe];
+  return {
+    openTime,
+    closeTime: openTime + ms - 1,
+    open: 0,
+    high: -Infinity,
+    low: Infinity,
+    close: 0,
+    volume: 0,
+    delta: 0,
+    cumulativeDelta: 0,
+    levels: /* @__PURE__ */ new Map(),
+    sortedPrices: [],
+    tradeCount: 0,
+    maxVolumeAtLevel: 0,
+    complete: false,
+    venueVolumes: {}
+  };
+}
+function applyTradeToCandle(candle, trade, tickSize, imbalanceThreshold) {
+  const roundedPrice = roundToTick(trade.price, tickSize);
+  if (candle.open === 0) candle.open = trade.price;
+  candle.close = trade.price;
+  if (trade.price > candle.high) candle.high = trade.price;
+  if (trade.price < candle.low) candle.low = trade.price;
+  let level = candle.levels.get(roundedPrice);
+  if (!level) {
+    level = {
+      price: roundedPrice,
+      bidVolume: 0,
+      askVolume: 0,
+      totalVolume: 0,
+      delta: 0,
+      tradeCount: 0,
+      buyTrades: 0,
+      sellTrades: 0,
+      maxTradeSize: 0,
+      imbalance: "neutral",
+      isHighVolume: false,
+      zScore: 0
+    };
+    candle.levels.set(roundedPrice, level);
+    insertSorted(candle.sortedPrices, roundedPrice);
+  }
+  if (trade.side === "buy") {
+    level.askVolume += trade.quantity;
+    level.buyTrades += 1;
+  } else {
+    level.bidVolume += trade.quantity;
+    level.sellTrades += 1;
+  }
+  level.totalVolume += trade.quantity;
+  level.delta = level.askVolume - level.bidVolume;
+  level.tradeCount += 1;
+  if (trade.quantity > level.maxTradeSize) level.maxTradeSize = trade.quantity;
+  if (level.bidVolume > 0 && level.askVolume / level.bidVolume >= imbalanceThreshold) {
+    level.imbalance = "ask";
+  } else if (level.askVolume > 0 && level.bidVolume / level.askVolume >= imbalanceThreshold) {
+    level.imbalance = "bid";
+  } else {
+    level.imbalance = "neutral";
+  }
+  candle.volume += trade.quantity;
+  candle.venueVolumes[trade.venue] = (candle.venueVolumes[trade.venue] ?? 0) + trade.quantity;
+  candle.tradeCount += 1;
+  if (trade.side === "buy") {
+    candle.delta += trade.quantity;
+  } else {
+    candle.delta -= trade.quantity;
+  }
+  if (level.totalVolume > candle.maxVolumeAtLevel) {
+    candle.maxVolumeAtLevel = level.totalVolume;
+  }
+  return candle;
+}
+function applyZScores(candle, allLevels) {
+  if (allLevels.length < 2) return;
+  const volumes = allLevels.map((l) => l.totalVolume);
+  const mean = volumes.reduce((a, b) => a + b, 0) / volumes.length;
+  const variance = volumes.reduce((a, b) => a + (b - mean) ** 2, 0) / volumes.length;
+  const std = Math.sqrt(variance);
+  if (std === 0) return;
+  for (const level of candle.levels.values()) {
+    level.zScore = (level.totalVolume - mean) / std;
+    level.isHighVolume = level.zScore >= 2;
+  }
+}
+function computeVolumeProfile(candles, valueAreaPct = 0.7) {
+  const map = /* @__PURE__ */ new Map();
+  for (const candle of candles) {
+    for (const [price, level] of candle.levels) {
+      const existing = map.get(price) ?? { bid: 0, ask: 0, trades: 0 };
+      existing.bid += level.bidVolume;
+      existing.ask += level.askVolume;
+      existing.trades += level.tradeCount;
+      map.set(price, existing);
+    }
+  }
+  const prices = [...map.keys()].sort((a, b) => a - b);
+  const totalVol = prices.reduce((s, p) => s + (map.get(p)?.bid ?? 0) + (map.get(p)?.ask ?? 0), 0);
+  let pocPrice = prices[0] ?? 0;
+  let pocVol = 0;
+  for (const p of prices) {
+    const d = map.get(p);
+    const v = d.bid + d.ask;
+    if (v > pocVol) {
+      pocVol = v;
+      pocPrice = p;
+    }
+  }
+  const target = totalVol * valueAreaPct;
+  let vah = pocPrice;
+  let val = pocPrice;
+  let accumulated = pocVol;
+  let hi = prices.indexOf(pocPrice);
+  let lo = hi;
+  while (accumulated < target && (hi < prices.length - 1 || lo > 0)) {
+    const nextHiVol = hi < prices.length - 1 ? ((d) => d.bid + d.ask)(map.get(prices[hi + 1])) : 0;
+    const nextLoVol = lo > 0 ? ((d) => d.bid + d.ask)(map.get(prices[lo - 1])) : 0;
+    if (nextHiVol >= nextLoVol && hi < prices.length - 1) {
+      hi++;
+      vah = prices[hi];
+      accumulated += nextHiVol;
+    } else if (lo > 0) {
+      lo--;
+      val = prices[lo];
+      accumulated += nextLoVol;
+    } else {
+      break;
+    }
+  }
+  const levels = prices.map((price) => {
+    const d = map.get(price);
+    const tv = d.bid + d.ask;
+    return {
+      price,
+      totalVolume: tv,
+      bidVolume: d.bid,
+      askVolume: d.ask,
+      delta: d.ask - d.bid,
+      tradeCount: d.trades,
+      isPOC: price === pocPrice,
+      isVAH: price === vah,
+      isVAL: price === val
+    };
+  });
+  const buyVolume = levels.reduce((s, l) => s + l.askVolume, 0);
+  const sellVolume = levels.reduce((s, l) => s + l.bidVolume, 0);
+  return {
+    levels,
+    poc: pocPrice,
+    vah,
+    val,
+    totalVolume: totalVol,
+    buyVolume,
+    sellVolume,
+    delta: buyVolume - sellVolume
+  };
+}
+function computeOBI(bidVolume, askVolume) {
+  const total = bidVolume + askVolume;
+  if (total === 0) return 0;
+  return (bidVolume - askVolume) / total;
+}
+function insertSorted(arr, val) {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = lo + hi >>> 1;
+    if (arr[mid] < val) lo = mid + 1;
+    else hi = mid;
+  }
+  if (arr[lo] !== val) arr.splice(lo, 0, val);
+}
+var TIMEFRAME_MS;
+var init_orderFlowEngine = __esm({
+  "src/lib/engine/orderFlowEngine.ts"() {
+    "use strict";
+    TIMEFRAME_MS = {
+      "1m": 6e4,
+      "5m": 3e5,
+      "15m": 9e5,
+      "30m": 18e5,
+      "1h": 36e5,
+      "4h": 144e5
+    };
+  }
+});
+
+// src/lib/engine/derivatives.ts
+function mergeDerivatives(previous, update) {
+  const merged = { ...previous ?? { venue: update.venue }, timestamp: update.timestamp };
+  for (const [key2, value] of Object.entries(update)) {
+    if (value !== void 0) merged[key2] = value;
+  }
+  return merged;
+}
+function fundingRate8h(snapshot) {
+  if (snapshot.fundingRate === void 0) return void 0;
+  const hours = snapshot.fundingIntervalHours ?? DEFAULT_FUNDING_HOURS;
+  return snapshot.fundingRate * (8 / hours);
+}
+function annualizeFunding(rate, intervalHours = DEFAULT_FUNDING_HOURS) {
+  return rate * (24 / intervalHours) * 365;
+}
+function aggregateDerivatives(snapshots, primaryVenue, referencePrice, oiVenues) {
+  if (!snapshots.length) return null;
+  const primary = snapshots.find((s) => s.venue === primaryVenue) ?? snapshots[0];
+  let oi = 0;
+  let oiValue = 0;
+  let oiCount = 0;
+  for (const s of snapshots) {
+    if (s.openInterest === void 0) continue;
+    if (oiVenues && !oiVenues.has(s.venue)) continue;
+    oi += s.openInterest;
+    oiValue += s.openInterest * (s.markPrice ?? referencePrice ?? 0);
+    oiCount++;
+  }
+  const weighted = (value) => {
+    let sum = 0;
+    let weight = 0;
+    for (const s of snapshots) {
+      const v = value(s);
+      if (v === void 0 || !Number.isFinite(v)) continue;
+      const w = s.openInterest && s.openInterest > 0 ? s.openInterest : 1;
+      sum += v * w;
+      weight += w;
+    }
+    return weight > 0 ? sum / weight : null;
+  };
+  return {
+    timestamp: Math.max(...snapshots.map((s) => s.timestamp)),
+    venues: snapshots,
+    openInterest: oiCount ? oi : null,
+    openInterestValue: oiCount && oiValue > 0 ? oiValue : null,
+    fundingRate8h: weighted(fundingRate8h),
+    nextFundingTime: primary.nextFundingTime ?? null,
+    fundingIntervalHours: primary.fundingRate !== void 0 ? primary.fundingIntervalHours ?? DEFAULT_FUNDING_HOURS : null,
+    primaryFundingRate: primary.fundingRate ?? null,
+    markPrice: weighted((s) => s.markPrice),
+    indexPrice: weighted((s) => s.indexPrice),
+    basisBps: weighted((s) => s.markPrice && s.indexPrice ? (s.markPrice - s.indexPrice) / s.indexPrice * 1e4 : void 0)
+  };
+}
+function classifyOIRegime(priceChange, oiChange, priceThreshold = 5e-4, oiThreshold = 1e-3) {
+  if (Math.abs(priceChange) < priceThreshold || Math.abs(oiChange) < oiThreshold) return "neutral";
+  if (priceChange > 0) return oiChange > 0 ? "new-longs" : "short-covering";
+  return oiChange > 0 ? "new-shorts" : "long-unwind";
+}
+function oiWindowChange(history, windowMs) {
+  if (history.length < 2) return null;
+  const to = history[history.length - 1];
+  const cutoff = to.time - windowMs;
+  let lo = 0;
+  let hi = history.length - 1;
+  while (lo < hi) {
+    const mid = lo + hi >> 1;
+    if (history[mid].time < cutoff) lo = mid + 1;
+    else hi = mid;
+  }
+  const from = history[lo];
+  if (from === to || !(from.openInterest > 0) || !(from.price > 0)) return null;
+  const priceChange = (to.price - from.price) / from.price;
+  const oiChange = (to.openInterest - from.openInterest) / from.openInterest;
+  return {
+    priceChange,
+    oiChange,
+    oiDelta: to.openInterest - from.openInterest,
+    regime: classifyOIRegime(priceChange, oiChange),
+    from,
+    to
+  };
+}
+function bucketLiquidations(liquidations, bucketMs, count, now2) {
+  const end = Math.floor(now2 / bucketMs) * bucketMs;
+  const start = end - (count - 1) * bucketMs;
+  const buckets = Array.from({ length: count }, (_, i) => ({
+    time: start + i * bucketMs,
+    longNotional: 0,
+    shortNotional: 0,
+    longQty: 0,
+    shortQty: 0,
+    count: 0
+  }));
+  for (const l of liquidations) {
+    const index = Math.floor((l.timestamp - start) / bucketMs);
+    if (index < 0 || index >= count) continue;
+    const b = buckets[index];
+    if (l.side === "long") {
+      b.longNotional += l.quoteVolume;
+      b.longQty += l.quantity;
+    } else {
+      b.shortNotional += l.quoteVolume;
+      b.shortQty += l.quantity;
+    }
+    b.count++;
+  }
+  return buckets;
+}
+function summarizeLiquidations(liquidations, since) {
+  const summary = { longNotional: 0, shortNotional: 0, count: 0, largest: null };
+  for (let i = liquidations.length - 1; i >= 0; i--) {
+    const l = liquidations[i];
+    if (l.timestamp < since - ARRIVAL_SLACK_MS) break;
+    if (l.timestamp < since) continue;
+    if (l.side === "long") summary.longNotional += l.quoteVolume;
+    else summary.shortNotional += l.quoteVolume;
+    summary.count++;
+    if (!summary.largest || l.quoteVolume > summary.largest.quoteVolume) summary.largest = l;
+  }
+  return summary;
+}
+function isLiquidationCascade(buckets, multiple = 5, floor = 0) {
+  if (buckets.length < 4) return false;
+  const last = buckets[buckets.length - 1];
+  const total = last.longNotional + last.shortNotional;
+  if (total <= floor) return false;
+  const history = buckets.slice(0, -1).map((b) => b.longNotional + b.shortNotional).filter((v) => v > 0).sort((a, b) => a - b);
+  if (history.length < 3) return false;
+  const median = history[Math.floor(history.length / 2)];
+  return total >= median * multiple;
+}
+var DEFAULT_FUNDING_HOURS, LIQUIDATION_FEED_VENUES, OI_REGIME_LABEL, OI_REGIME_HINT, ARRIVAL_SLACK_MS;
+var init_derivatives = __esm({
+  "src/lib/engine/derivatives.ts"() {
+    "use strict";
+    DEFAULT_FUNDING_HOURS = 8;
+    LIQUIDATION_FEED_VENUES = /* @__PURE__ */ new Set([
+      "binance-futures",
+      "bybit-futures",
+      "okx-futures",
+      "deribit"
+    ]);
+    OI_REGIME_LABEL = {
+      "new-longs": "New longs",
+      "short-covering": "Short covering",
+      "new-shorts": "New shorts",
+      "long-unwind": "Long unwind",
+      neutral: "Balanced"
+    };
+    OI_REGIME_HINT = {
+      "new-longs": "Price up with rising open interest: fresh long positioning is driving the move.",
+      "short-covering": "Price up with falling open interest: shorts are closing; the rally is driven by exits, not new demand.",
+      "new-shorts": "Price down with rising open interest: fresh short positioning is driving the move.",
+      "long-unwind": "Price down with falling open interest: longs are closing or being liquidated.",
+      neutral: "Price or open interest is roughly flat over the window."
+    };
+    ARRIVAL_SLACK_MS = 6e4;
+  }
+});
+
+// src/screener-page.ts
+var SCREENER_PAGE;
+var init_screener_page = __esm({
+  "src/screener-page.ts"() {
+    "use strict";
+    SCREENER_PAGE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Order Flow Screener</title>
+<style>
+:root {
+  --bg: #000; --fg: #fff; --muted: #8e8e93; --faint: #48484a; --line: #1c1c1e; --chip: #1c1c1e;
+  --up: #30d158; --down: #ff453a; --up-pill: #34c759; --down-pill: #ff3b30; --pill-fg: #fff;
+  --flat: #636366; --warn: #ffd60a;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #fff; --fg: #000; --muted: #6c6c70; --faint: #c7c7cc; --line: #e5e5ea; --chip: #f2f2f7;
+    --up: #248a3d; --down: #d70015; --flat: #8e8e93; --warn: #b25000; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); }
+body {
+  font: 16px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums;
+  padding: 0 16px env(safe-area-inset-bottom);
+}
+main { max-width: 760px; margin: 0 auto; }
+header {
+  position: sticky; top: 0; z-index: 2; background: var(--bg);
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  padding: 20px 0 12px; border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; margin: 0; }
+.sub { color: var(--muted); font-size: 14px; margin-top: 4px; display: flex; align-items: center; gap: 6px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--up); box-shadow: 0 0 0 0 var(--up); animation: beat 2s infinite; }
+.dot.off { background: var(--flat); animation: none; }
+@keyframes beat { 0% { box-shadow: 0 0 0 0 rgba(48,209,88,.6); } 70% { box-shadow: 0 0 0 7px rgba(48,209,88,0); } 100% { box-shadow: 0 0 0 0 rgba(48,209,88,0); } }
+.seg { display: inline-flex; background: var(--chip); border-radius: 9px; padding: 2px; }
+.seg button {
+  font: inherit; font-size: 13px; font-weight: 600; color: var(--muted); background: none; border: 0;
+  padding: 6px 11px; border-radius: 7px; cursor: pointer;
+}
+.seg button[aria-pressed="true"] { background: var(--faint); color: var(--fg); }
+.row {
+  display: grid; grid-template-columns: minmax(0, 1fr) 128px minmax(108px, auto); column-gap: 16px; align-items: center;
+  padding: 14px 0 12px; border-bottom: 1px solid var(--line);
+}
+.id { min-width: 0; }
+.sym { font-size: 21px; font-weight: 700; letter-spacing: -0.01em; display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+.tag { font-size: 10px; font-weight: 700; color: var(--muted); border: 1px solid var(--faint); border-radius: 4px; padding: 1px 4px; letter-spacing: .04em; }
+.name { color: var(--muted); font-size: 15px; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.badge { font-size: 10px; font-weight: 800; letter-spacing: .05em; border-radius: 4px; padding: 2px 5px; }
+.badge.cascade { background: var(--down-pill); color: #fff; animation: blink 1s steps(2, start) infinite; }
+.badge.warm { color: var(--warn); border: 1px solid currentColor; font-weight: 700; }
+@keyframes blink { to { opacity: .45; } }
+svg.spark { width: 128px; height: 46px; display: block; overflow: visible; }
+.quote { text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
+.px { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; transition: color .5s; }
+.px .d { border-radius: 3px; transition: background-color .6s, color .6s; }
+.px.up .d { color: var(--up); background: rgba(48,209,88,.16); transition: none; }
+.px.down .d { color: var(--down); background: rgba(255,69,58,.16); transition: none; }
+.pill {
+  font: inherit; font-size: 16px; font-weight: 600; min-width: 96px; text-align: right; color: var(--pill-fg);
+  background: var(--flat); border: 0; border-radius: 7px; padding: 5px 9px; cursor: pointer; white-space: nowrap;
+}
+.pill.up { background: var(--up-pill); } .pill.down { background: var(--down-pill); }
+.flow { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chip { font-size: 12px; background: var(--chip); color: var(--muted); border-radius: 6px; padding: 3px 7px; white-space: nowrap; }
+.chip b { font-weight: 600; color: var(--fg); }
+.chip b.up { color: var(--up); } .chip b.down { color: var(--down); } .chip.hot { box-shadow: inset 0 0 0 1px var(--warn); }
+.empty { color: var(--muted); padding: 40px 0; text-align: center; line-height: 1.6; }
+.empty code { background: var(--chip); padding: 2px 6px; border-radius: 5px; color: var(--fg); }
+section.tape { margin: 26px 0 10px; }
+section.tape h2 { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 0 0 6px; }
+.ev { display: grid; grid-template-columns: 70px 52px minmax(0, 1fr) auto; gap: 10px; font-size: 14px; padding: 7px 0; border-bottom: 1px solid var(--line); align-items: baseline; }
+.ev .t { color: var(--muted); } .ev .b { font-weight: 700; } .ev .x { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev .u.up { color: var(--up); } .ev .u.down { color: var(--down); }
+.ev.new { animation: slide .5s ease-out; }
+@keyframes slide { from { background: var(--chip); } to { background: transparent; } }
+footer { color: var(--muted); font-size: 12px; padding: 18px 0 28px; line-height: 1.5; }
+@media (max-width: 480px) {
+  .row { grid-template-columns: minmax(0, 1fr) 84px minmax(96px, auto); column-gap: 10px; }
+  svg.spark { width: 84px; }
+  .sym, .px { font-size: 18px; }
+  .pill { font-size: 14px; min-width: 82px; }
+  .name { font-size: 13px; }
+  .ev { grid-template-columns: 62px 44px minmax(0, 1fr) auto; font-size: 13px; }
+  .chip.minor { display: none; }
+  .chip { font-size: 11px; }
+}
+@media (prefers-reduced-motion: reduce) { .dot, .badge.cascade, .ev.new { animation: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Order Flow</h1>
+      <div class="sub"><span class="dot off" id="dot"></span><span id="status">Connecting\u2026</span></div>
+    </div>
+    <nav class="seg" id="seg" aria-label="Change window">
+      <button data-w="15m">15m</button><button data-w="1h">1h</button><button data-w="4h">4h</button><button data-w="session">Session</button>
+    </nav>
+  </header>
+  <div id="list"></div>
+  <section class="tape" id="tapeBox" hidden>
+    <h2>Live tape</h2>
+    <div id="tape"></div>
+  </section>
+  <footer>
+    Prices are the median of each venue's latest print; change is measured from the start of the selected window
+    (or from when the market began streaming). Markets appear here as soon as your agent streams them.
+    Market data for analysis only, not financial advice.
+  </footer>
+</main>
+<script>
+(function () {
+  "use strict";
+  var params = new URLSearchParams(location.search);
+  var token = params.get("token");
+  var store = {
+    get: function (k, d) { try { return localStorage.getItem("ofs." + k) || d; } catch (e) { return d; } },
+    set: function (k, v) { try { localStorage.setItem("ofs." + k, v); } catch (e) {} }
+  };
+  var win = params.get("window") || store.get("window", "1h");
+  var pillMode = store.get("pill", "pct");
+  var rows = new Map();     // key -> { data, el, refs }
+  var seenEvents = new Set();
+  var listEl = document.getElementById("list");
+  var es = null, lastMsg = 0;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function fmtPrice(x, d) {
+    if (x === null || x === undefined) return "\u2014";
+    return x.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+  function fmtUsd(x) {
+    var a = Math.abs(x), s = x < 0 ? "-" : "";
+    if (a >= 1e9) return s + "$" + (a / 1e9).toFixed(2) + "B";
+    if (a >= 1e6) return s + "$" + (a / 1e6).toFixed(2) + "M";
+    if (a >= 1e3) return s + "$" + (a / 1e3).toFixed(0) + "K";
+    return s + "$" + a.toFixed(0);
+  }
+  function fmtNum(x) {
+    var a = Math.abs(x);
+    if (a >= 1e6) return (x / 1e6).toFixed(2) + "M";
+    if (a >= 1e3) return (x / 1e3).toFixed(1) + "K";
+    if (a >= 100) return x.toFixed(0);
+    if (a >= 1) return x.toFixed(2);
+    return x.toPrecision(2);
+  }
+  function signed(s, x) { return (x > 0 ? "+" : "") + s; }
+  function dir(x) { return x > 0 ? "up" : x < 0 ? "down" : ""; }
+
+  // \u2500\u2500\u2500 row DOM \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  function makeRow(d) {
+    var row = el("div", "row");
+    var id = el("div", "id");
+    var sym = el("div", "sym");
+    var symText = el("span", "", d.base);
+    var tag = el("span", "tag", d.market_type === "perp" ? "PERP" : "SPOT");
+    var badges = el("span");
+    sym.append(symText, tag, badges);
+    var venue = d.venue.indexOf("all-") === 0 ? "all venues" : d.venue.replace(/-(futures|spot)$/, "");
+    var name = el("div", "name", d.name + " \xB7 " + venue);
+    id.append(sym, name);
+
+    var svg = svgEl("svg", { class: "spark", viewBox: "0 0 128 46", preserveAspectRatio: "none" });
+    var gid = "g" + Math.random().toString(36).slice(2);
+    var defs = svgEl("defs", {});
+    var grad = svgEl("linearGradient", { id: gid, x1: "0", y1: "0", x2: "0", y2: "1" });
+    var s1 = svgEl("stop", { offset: "0%", "stop-opacity": "0.45" });
+    var s2 = svgEl("stop", { offset: "100%", "stop-opacity": "0" });
+    grad.append(s1, s2); defs.append(grad);
+    var base = svgEl("line", { x1: "0", x2: "128", "stroke-dasharray": "3 3", "stroke-width": "1", "vector-effect": "non-scaling-stroke", opacity: "0.8" });
+    var area = svgEl("path", { fill: "url(#" + gid + ")", stroke: "none" });
+    var line = svgEl("path", { fill: "none", "stroke-width": "1.75", "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke" });
+    svg.append(defs, area, base, line);
+
+    var quote = el("div", "quote");
+    var px = el("div", "px");
+    var pill = el("button", "pill");
+    pill.title = "Tap to switch between % and price change";
+    pill.addEventListener("click", function () {
+      pillMode = pillMode === "pct" ? "abs" : "pct";
+      store.set("pill", pillMode);
+      rows.forEach(function (r) { renderQuote(r, false); });
+    });
+    quote.append(px, pill);
+    var flow = el("div", "flow");
+    row.append(id, svg, quote, flow);
+    return { el: row, refs: { badges: badges, s1: s1, s2: s2, base: base, area: area, line: line, px: px, pill: pill, flow: flow, svg: svg }, shown: null, flashTimer: 0 };
+  }
+
+  function renderSpark(r) {
+    var d = r.data, refs = r.refs;
+    var vals = d.spark.slice();
+    if (d.last !== null && vals.length) vals[vals.length - 1] = d.last;
+    var pts = [];
+    var lo = Infinity, hi = -Infinity;
+    for (var i = 0; i < vals.length; i++) if (vals[i] !== null) { lo = Math.min(lo, vals[i]); hi = Math.max(hi, vals[i]); }
+    if (!isFinite(lo)) { refs.line.setAttribute("d", ""); refs.area.setAttribute("d", ""); refs.base.setAttribute("opacity", "0"); return; }
+    if (d.baseline !== null) { lo = Math.min(lo, d.baseline); hi = Math.max(hi, d.baseline); }
+    var pad = (hi - lo) * 0.08 || Math.abs(hi) * 0.0005 || 1;
+    lo -= pad; hi += pad;
+    var W = 128, H = 46, n = vals.length;
+    function y(v) { return (H - ((v - lo) / (hi - lo)) * H).toFixed(2); }
+    for (var j = 0; j < n; j++) if (vals[j] !== null) pts.push([(n > 1 ? (j / (n - 1)) * W : W).toFixed(2), y(vals[j])]);
+    var lineD = "M" + pts.map(function (p) { return p[0] + " " + p[1]; }).join(" L");
+    refs.line.setAttribute("d", lineD);
+    refs.area.setAttribute("d", lineD + " L" + pts[pts.length - 1][0] + " " + H + " L" + pts[0][0] + " " + H + " Z");
+    var up = d.change === null || d.change >= 0;
+    var c = getComputedStyle(document.documentElement).getPropertyValue(up ? "--up" : "--down");
+    refs.line.setAttribute("stroke", c);
+    refs.s1.setAttribute("stop-color", c); refs.s2.setAttribute("stop-color", c);
+    refs.base.setAttribute("stroke", c);
+    if (d.baseline !== null) { var by = y(d.baseline); refs.base.setAttribute("y1", by); refs.base.setAttribute("y2", by); refs.base.setAttribute("opacity", "0.8"); }
+  }
+
+  function renderQuote(r, flash) {
+    var d = r.data, refs = r.refs;
+    var text = fmtPrice(d.last, d.decimals);
+    var prev = r.shown;
+    refs.px.textContent = "";
+    if (flash && prev && prev !== text && prev.length === text.length) {
+      var k = 0;
+      while (k < text.length && text[k] === prev[k]) k++;
+      refs.px.append(document.createTextNode(text.slice(0, k)), el("span", "d", text.slice(k)));
+      var moved = d.last - r.prevPrice;
+      refs.px.classList.remove("up", "down");
+      void refs.px.offsetWidth;
+      refs.px.classList.add(moved >= 0 ? "up" : "down");
+      clearTimeout(r.flashTimer);
+      r.flashTimer = setTimeout(function () { refs.px.classList.remove("up", "down"); }, 450);
+    } else {
+      refs.px.append(el("span", "d", text));
+    }
+    r.shown = text;
+    r.prevPrice = d.last;
+    var ch = d.change;
+    refs.pill.className = "pill " + (ch === null ? "" : dir(ch));
+    if (ch === null) refs.pill.textContent = "\u2014";
+    else if (pillMode === "pct") refs.pill.textContent = signed(d.change_pct.toFixed(2) + "%", d.change_pct);
+    else refs.pill.textContent = signed(fmtPrice(ch, d.decimals), ch);
+  }
+
+  function chip(label, value, cls, hot, minor) {
+    var c = el("span", "chip" + (hot ? " hot" : "") + (minor ? " minor" : ""));
+    c.append(document.createTextNode(label + " "), el("b", cls || "", value));
+    return c;
+  }
+
+  function renderFlow(r) {
+    var d = r.data, refs = r.refs;
+    var chips = [];
+    if (d.delta_5m !== null) chips.push(chip("\u0394 5m", signed(fmtNum(d.delta_5m), d.delta_5m), dir(d.delta_5m)));
+    if (d.buy_pct_5m !== null) chips.push(chip("Buy", d.buy_pct_5m.toFixed(0) + "%", d.buy_pct_5m >= 55 ? "up" : d.buy_pct_5m <= 45 ? "down" : ""));
+    if (d.notional_5m_usd !== null) chips.push(chip("Vol 5m", fmtUsd(d.notional_5m_usd), "", false, true));
+    if (d.volume_z_1m !== null) chips.push(chip("Vol z", d.volume_z_1m.toFixed(1), "", Math.abs(d.volume_z_1m) >= 3, Math.abs(d.volume_z_1m) < 3));
+    if (d.obi !== null) chips.push(chip("Book", signed(d.obi.toFixed(2), d.obi), dir(d.obi)));
+    if (d.sigma_from_vwap !== null) chips.push(chip("VWAP", signed(d.sigma_from_vwap.toFixed(1) + "\u03C3", d.sigma_from_vwap), "", Math.abs(d.sigma_from_vwap) >= 2, Math.abs(d.sigma_from_vwap) < 2));
+    if (d.funding_8h_pct !== null) chips.push(chip("Fund 8h", d.funding_8h_pct.toFixed(4) + "%", dir(d.funding_8h_pct)));
+    if (d.oi_change_5m_pct !== null) chips.push(chip("OI 5m", signed(d.oi_change_5m_pct.toFixed(2) + "%", d.oi_change_5m_pct), dir(d.oi_change_5m_pct)));
+    if (d.market_type === "perp") {
+      var liq = d.liq_long_5m_usd + d.liq_short_5m_usd;
+      chips.push(chip("Liq 5m", liq ? "L " + fmtUsd(d.liq_long_5m_usd) + " \xB7 S " + fmtUsd(d.liq_short_5m_usd) : "$0", "", d.cascade));
+    }
+    if (d.big_prints_5m) chips.push(chip("Big prints", String(d.big_prints_5m), "", false, true));
+    chips.push(chip("Live", d.live_venues, "", false, true));
+    refs.flow.replaceChildren.apply(refs.flow, chips);
+
+    var badges = [];
+    if (d.cascade) badges.push(el("span", "badge cascade", "LIQ CASCADE"));
+    if (!d.ready || d.stream_age_s < 60) badges.push(el("span", "badge warm", d.ready ? "WARMING UP" : "CONNECTING"));
+    refs.badges.replaceChildren.apply(refs.badges, badges);
+  }
+
+  // \u2500\u2500\u2500 stream handling \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  function onFull(msg) {
+    var keys = new Set();
+    msg.rows.forEach(function (d) {
+      keys.add(d.key);
+      var r = rows.get(d.key);
+      if (!r) { r = makeRow(d); rows.set(d.key, r); }
+      var flash = r.data && r.data.last !== d.last;
+      r.data = d;
+      renderQuote(r, flash);
+      renderSpark(r);
+      renderFlow(r);
+    });
+    rows.forEach(function (r, key) { if (!keys.has(key)) { r.el.remove(); rows.delete(key); } });
+    // Keep DOM order equal to server order.
+    var order = msg.rows.map(function (d) { return rows.get(d.key).el; });
+    var same = order.length === listEl.children.length && order.every(function (e, i) { return listEl.children[i] === e; });
+    if (!same) listEl.replaceChildren.apply(listEl, order);
+    if (!msg.rows.length) {
+      var empty = el("div", "empty");
+      empty.append(document.createTextNode("No markets are streaming yet. Ask your agent to "), el("code", "", "watch_markets"), document.createTextNode(" or "), el("code", "", "open_screener"), document.createTextNode(" with some symbols."));
+      listEl.replaceChildren(empty);
+    }
+    renderTape(msg.events || []);
+    setStatus(true, msg.rows.length);
+  }
+
+  function onTick(msg) {
+    for (var key in msg.p) {
+      var r = rows.get(key);
+      if (!r) continue;
+      var d = r.data, p = msg.p[key];
+      d.last = p;
+      if (d.baseline !== null) { d.change = p - d.baseline; d.change_pct = d.baseline ? ((p - d.baseline) / d.baseline) * 100 : 0; }
+      renderQuote(r, true);
+      renderSpark(r);
+    }
+    lastMsg = Date.now();
+  }
+
+  function renderTape(events) {
+    var box = document.getElementById("tapeBox"), tape = document.getElementById("tape");
+    box.hidden = !events.length;
+    var nodes = events.map(function (e) {
+      var id = e.time + e.base + e.kind + e.usd;
+      var row = el("div", "ev" + (seenEvents.size && !seenEvents.has(id) ? " new" : ""));
+      var t = new Date(e.time);
+      row.append(
+        el("span", "t", t.toLocaleTimeString([], { hour12: false })),
+        el("span", "b", e.base),
+        el("span", "x", e.text),
+        el("span", "u " + (e.side === "buy" ? "up" : "down"), fmtUsd(e.usd))
+      );
+      return { id: id, node: row };
+    });
+    nodes.forEach(function (n) { seenEvents.add(n.id); });
+    if (seenEvents.size > 2000) seenEvents = new Set(nodes.map(function (n) { return n.id; }));
+    tape.replaceChildren.apply(tape, nodes.map(function (n) { return n.node; }));
+  }
+
+  function setStatus(live, count) {
+    lastMsg = Date.now();
+    document.getElementById("dot").className = "dot" + (live ? "" : " off");
+    document.getElementById("status").textContent = live
+      ? "Live \xB7 " + count + (count === 1 ? " market" : " markets") + " \xB7 " + new Date().toLocaleTimeString([], { hour12: false })
+      : "Reconnecting\u2026";
+  }
+
+  function connect() {
+    if (es) es.close();
+    var q = "window=" + encodeURIComponent(win) + (token ? "&token=" + encodeURIComponent(token) : "");
+    es = new EventSource("/screener/stream?" + q);
+    es.addEventListener("full", function (ev) { onFull(JSON.parse(ev.data)); });
+    es.addEventListener("tick", function (ev) { onTick(JSON.parse(ev.data)); });
+    es.onerror = function () { setStatus(false, 0); };
+  }
+  setInterval(function () { if (Date.now() - lastMsg > 5000) setStatus(false, 0); }, 2000);
+
+  var seg = document.getElementById("seg");
+  function markSeg() {
+    Array.prototype.forEach.call(seg.children, function (b) { b.setAttribute("aria-pressed", String(b.dataset.w === win)); });
+  }
+  seg.addEventListener("click", function (ev) {
+    var w = ev.target && ev.target.dataset && ev.target.dataset.w;
+    if (!w || w === win) return;
+    win = w; store.set("window", w); markSeg(); connect();
+  });
+  markSeg();
+  connect();
+})();
+</script>
+</body>
+</html>
+`;
+  }
+});
+
+// src/lib/engine/imbalance.ts
+function imbalanceOf(level, ratio) {
+  if (level.bidVolume > 0 && level.askVolume / level.bidVolume >= ratio) return "buy";
+  if (level.askVolume > 0 && level.bidVolume / level.askVolume >= ratio) return "sell";
+  return null;
+}
+function stackedRuns(candle, ratio, minLevels) {
+  const out = [];
+  const prices = candle.sortedPrices;
+  let dir2 = null;
+  let startIndex = 0;
+  const flush = (endIndex) => {
+    if (dir2 && endIndex - startIndex + 1 >= minLevels) out.push({ dir: dir2, start: prices[startIndex], end: prices[endIndex] });
+  };
+  for (let i = 0; i < prices.length; i++) {
+    const level = candle.levels.get(prices[i]);
+    const d = level ? imbalanceOf(level, ratio) : null;
+    if (d !== dir2) {
+      flush(i - 1);
+      dir2 = d;
+      startIndex = i;
+    }
+  }
+  flush(prices.length - 1);
+  return out;
+}
+var init_imbalance = __esm({
+  "src/lib/engine/imbalance.ts"() {
+    "use strict";
+  }
+});
+
+// src/lib/engine/analytics.ts
+function secondsPerYear(_marketType) {
+  return SECONDS_PER_YEAR.crypto;
+}
+function createFlowBar(time2, price, cvd) {
+  return {
+    time: time2,
+    open: price,
+    high: price,
+    low: price,
+    close: price,
+    volume: 0,
+    buyVolume: 0,
+    sellVolume: 0,
+    trades: 0,
+    cvd
+  };
+}
+function resampleBars(bars, seconds) {
+  if (seconds <= 1) return bars;
+  const bucketMs = seconds * 1e3;
+  const out = [];
+  let current = null;
+  for (const bar of bars) {
+    const bucket = Math.floor(bar.time / bucketMs) * bucketMs;
+    if (!current || current.time !== bucket) {
+      if (current) out.push(current);
+      current = { ...bar, time: bucket };
+      continue;
+    }
+    current.high = Math.max(current.high, bar.high);
+    current.low = Math.min(current.low, bar.low);
+    current.close = bar.close;
+    current.volume += bar.volume;
+    current.buyVolume += bar.buyVolume;
+    current.sellVolume += bar.sellVolume;
+    current.trades += bar.trades;
+    current.cvd = bar.cvd;
+  }
+  if (current) out.push(current);
+  return out;
+}
+function rollingVolumeZScores(bars, window, minSamples = Math.min(window, 10)) {
+  const out = new Array(bars.length);
+  let sum = 0;
+  let sumSq = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const n = Math.min(i, window);
+    let mean = null;
+    let std = null;
+    let z2 = null;
+    if (n >= Math.max(2, minSamples)) {
+      mean = sum / n;
+      const variance = Math.max(0, (sumSq - n * mean * mean) / (n - 1));
+      std = Math.sqrt(variance);
+      z2 = std > 0 ? (bars[i].volume - mean) / std : 0;
+    }
+    out[i] = {
+      time: bars[i].time,
+      z: z2,
+      volume: bars[i].volume,
+      buyVolume: bars[i].buyVolume,
+      sellVolume: bars[i].sellVolume,
+      mean,
+      std
+    };
+    sum += bars[i].volume;
+    sumSq += bars[i].volume ** 2;
+    if (i - window >= 0) {
+      sum -= bars[i - window].volume;
+      sumSq -= bars[i - window].volume ** 2;
+    }
+  }
+  return out;
+}
+function rollingRealizedVolatility(bars, window, barSeconds, yearSeconds, minSamples = Math.min(window, 10)) {
+  const annualize = Math.sqrt(yearSeconds / barSeconds);
+  const returns2 = new Array(bars.length).fill(0);
+  for (let i = 1; i < bars.length; i++) {
+    const prev = bars[i - 1].close;
+    const curr = bars[i].close;
+    returns2[i] = prev > 0 && curr > 0 ? Math.log(curr / prev) : 0;
+  }
+  const out = new Array(bars.length);
+  let sumSq = 0;
+  for (let i = 0; i < bars.length; i++) {
+    if (i >= 1) sumSq += returns2[i] ** 2;
+    if (i - window >= 1) sumSq -= returns2[i - window] ** 2;
+    const n = Math.min(i, window);
+    out[i] = {
+      time: bars[i].time,
+      value: n >= Math.max(2, minSamples) ? Math.sqrt(Math.max(0, sumSq) / n) * annualize * 100 : null
+    };
+  }
+  return out;
+}
+function createSessionStats(startTime, price) {
+  return {
+    startTime,
+    open: price,
+    high: price,
+    low: price,
+    last: price,
+    volume: 0,
+    notional: 0,
+    buyVolume: 0,
+    sellVolume: 0,
+    trades: 0,
+    maxTrade: 0,
+    vwap: price,
+    vwapStd: 0,
+    sumPQ: 0,
+    sumP2Q: 0,
+    lastTradeLagMs: 0
+  };
+}
+function applyTradeToSession(stats, price, quantity, side, lagMs) {
+  stats.last = price;
+  if (price > stats.high) stats.high = price;
+  if (price < stats.low) stats.low = price;
+  stats.volume += quantity;
+  stats.notional += price * quantity;
+  if (side === "buy") stats.buyVolume += quantity;
+  else stats.sellVolume += quantity;
+  stats.trades += 1;
+  if (quantity > stats.maxTrade) stats.maxTrade = quantity;
+  stats.sumPQ += price * quantity;
+  stats.sumP2Q += price * price * quantity;
+  if (stats.volume > 0) {
+    stats.vwap = stats.sumPQ / stats.volume;
+    const variance = stats.sumP2Q / stats.volume - stats.vwap * stats.vwap;
+    stats.vwapStd = Math.sqrt(Math.max(0, variance));
+  }
+  stats.lastTradeLagMs = lagMs;
+}
+function resolveTickSize(price, _marketType) {
+  if (!Number.isFinite(price) || price <= 0) return 1;
+  const raw = price * 1e-4;
+  const exponent = Math.floor(Math.log10(raw));
+  const magnitude = 10 ** exponent;
+  const normalized = raw / magnitude;
+  const nice = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 2.5 ? 2.5 : normalized <= 5 ? 5 : 10;
+  return Number((nice * magnitude).toPrecision(6));
+}
+var SECONDS_PER_YEAR;
+var init_analytics = __esm({
+  "src/lib/engine/analytics.ts"() {
+    "use strict";
+    SECONDS_PER_YEAR = {
+      // Crypto trades 24/7.
+      crypto: 365 * 86400
+    };
+  }
+});
+
+// src/lib/engine/venues.ts
+function grid(list, from, count) {
+  const out = new Float64Array(count);
+  let j = 0;
+  let last = NaN;
+  for (let i = 0; i < count; i++) {
+    const t = from + i * VENUE_BUCKET_MS;
+    while (j < list.length && list[j].time <= t) last = list[j++].close;
+    out[i] = last;
+  }
+  return Number.isFinite(out[0]) ? out : null;
+}
+function returns(prices) {
+  const r = new Float64Array(prices.length - 1);
+  for (let i = 1; i < prices.length; i++) r[i - 1] = Math.log(prices[i] / prices[i - 1]);
+  return r;
+}
+function laggedCorrelation(a, b, lag) {
+  let sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, n = 0;
+  for (let t = Math.max(0, -lag); t < a.length && t + lag < b.length; t++) {
+    const x = a[t];
+    const y = b[t + lag];
+    sa += x;
+    sb += y;
+    saa += x * x;
+    sbb += y * y;
+    sab += x * y;
+    n++;
+  }
+  if (n < 10) return 0;
+  const cov = sab / n - sa / n * (sb / n);
+  const va = saa / n - (sa / n) ** 2;
+  const vb = sbb / n - (sb / n) ** 2;
+  return va > 0 && vb > 0 ? cov / Math.sqrt(va * vb) : 0;
+}
+function venueSummary(series, now2, windowMs = 6e4, leadWindowMs = 15e4, maxLag = 8, minCorr = 0.1) {
+  const venues = Object.keys(series).filter((v) => series[v]?.length);
+  const lasts = venues.map((v) => series[v][series[v].length - 1].close).sort((a, b) => a - b);
+  const median = lasts.length ? lasts[Math.floor(lasts.length / 2)] : 0;
+  const since = now2 - windowMs;
+  let totalVolume = 0;
+  const stats = venues.map((venue) => {
+    const list = series[venue];
+    let volume = 0;
+    let delta = 0;
+    for (let i = list.length - 1; i >= 0 && list[i].time >= since; i--) {
+      volume += list[i].buy + list[i].sell;
+      delta += list[i].buy - list[i].sell;
+    }
+    totalVolume += volume;
+    const last = list[list.length - 1].close;
+    return { venue, last, premiumBps: median ? (last - median) / median * 1e4 : 0, volume, share: 0, delta, leadMs: null, leadCorr: null };
+  });
+  for (const s of stats) s.share = totalVolume ? s.volume / totalVolume : 0;
+  const sharedStart = Math.max(now2 - leadWindowMs, ...venues.map((v) => series[v][0].time));
+  const from = Math.ceil(sharedStart / VENUE_BUCKET_MS) * VENUE_BUCKET_MS;
+  const count = Math.floor((now2 - from) / VENUE_BUCKET_MS);
+  if (venues.length >= 2 && count >= MIN_LEAD_BUCKETS) {
+    const r = /* @__PURE__ */ new Map();
+    for (const venue of venues) {
+      const prices = grid(series[venue], from, count);
+      if (prices) r.set(venue, returns(prices));
+    }
+    for (const stat of stats) {
+      const own = r.get(stat.venue);
+      const others = [...r.entries()].filter(([v]) => v !== stat.venue).map(([, x]) => x);
+      if (!own || !others.length) continue;
+      const ref = new Float64Array(own.length);
+      for (const o of others) for (let i = 0; i < ref.length; i++) ref[i] += o[i] / others.length;
+      let bestLag = 0;
+      let best = laggedCorrelation(own, ref, 0);
+      for (let lag = -maxLag; lag <= maxLag; lag++) {
+        if (lag === 0) continue;
+        const c = laggedCorrelation(own, ref, lag);
+        if (c > best) {
+          best = c;
+          bestLag = lag;
+        }
+      }
+      if (best < minCorr) continue;
+      stat.leadMs = bestLag * VENUE_BUCKET_MS;
+      stat.leadCorr = best;
+    }
+  }
+  stats.sort((a, b) => b.volume - a.volume);
+  const leaders = stats.filter((s) => s.leadMs !== null && s.leadMs > 0).sort((a, b) => b.leadMs - a.leadMs || b.leadCorr - a.leadCorr);
+  return { stats, leader: leaders[0] ?? null };
+}
+var VENUE_BUCKET_MS, VENUE_BUCKETS, MIN_LEAD_BUCKETS, VenueTracker;
+var init_venues = __esm({
+  "src/lib/engine/venues.ts"() {
+    "use strict";
+    VENUE_BUCKET_MS = 250;
+    VENUE_BUCKETS = 720;
+    MIN_LEAD_BUCKETS = 120;
+    VenueTracker = class {
+      series = /* @__PURE__ */ new Map();
+      clear() {
+        this.series.clear();
+      }
+      onTrade(trade) {
+        const time2 = Math.floor(trade.timestamp / VENUE_BUCKET_MS) * VENUE_BUCKET_MS;
+        let list = this.series.get(trade.venue);
+        if (!list) {
+          list = [];
+          this.series.set(trade.venue, list);
+        }
+        let bucket = list[list.length - 1];
+        if (!bucket || time2 > bucket.time) {
+          bucket = { time: time2, close: trade.price, buy: 0, sell: 0, trades: 0 };
+          list.push(bucket);
+          if (list.length > VENUE_BUCKETS) list.splice(0, list.length - VENUE_BUCKETS);
+        } else if (time2 < bucket.time) {
+        } else {
+          bucket.close = trade.price;
+        }
+        if (trade.side === "buy") bucket.buy += trade.quantity;
+        else bucket.sell += trade.quantity;
+        bucket.trades++;
+      }
+      snapshot() {
+        const out = {};
+        for (const [venue, list] of this.series) out[venue] = list.map((b) => ({ ...b }));
+        return out;
+      }
+    };
+  }
+});
+
+// src/views.ts
+function sig(x, digits = 5) {
+  if (x === null || x === void 0 || !Number.isFinite(x)) return null;
+  if (x === 0) return 0;
+  return Number(x.toPrecision(digits));
+}
+function fixed(x, decimals) {
+  if (x === null || x === void 0 || !Number.isFinite(x)) return null;
+  return Number(x.toFixed(decimals));
+}
+function iso(ms) {
+  if (!ms || !Number.isFinite(ms)) return null;
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+function usd(x) {
+  if (x === null || x === void 0 || !Number.isFinite(x)) return null;
+  const a = Math.abs(x), sign = x < 0 ? "-" : "";
+  if (a >= 1e9) return `${sign}$${(a / 1e9).toFixed(2)}B`;
+  if (a >= 1e6) return `${sign}$${(a / 1e6).toFixed(2)}M`;
+  if (a >= 1e3) return `${sign}$${(a / 1e3).toFixed(1)}K`;
+  return `${sign}$${a.toFixed(0)}`;
+}
+function pricer(market) {
+  const tick = market.manager.tickSize || 1;
+  const decimals = Math.min(10, getTickDecimals(tick) + 1);
+  return (p) => fixed(p, decimals);
+}
+function header(market) {
+  const s = market.state;
+  const age = Math.round(market.ageMs / 1e3);
+  return {
+    market: {
+      symbol: market.spec.symbol,
+      market_type: market.spec.marketType,
+      venue_selection: market.spec.selection,
+      venues: market.spec.venues
+    },
+    as_of: iso(s.marketClock || Date.now()),
+    streaming_since: iso(market.startedAt),
+    stream_age_s: age,
+    warming_up: !market.ready || age < 60,
+    tick_size: market.manager.tickSize
+  };
+}
+function connectionsView(market) {
+  const seen = market.manager.lastDataAt;
+  return market.connections().map((c) => {
+    const at = seen.get(c.venue);
+    return {
+      venue: c.venue,
+      status: c.status,
+      ...c.error && c.status !== "live" ? { error: c.error } : {},
+      last_data_s_ago: at ? fixed((Date.now() - at) / 1e3, 1) : null
+    };
+  });
+}
+function referenceLast(market, tape = market.manager.getTapeLog()) {
+  if (!tape.length) return null;
+  const wanted = market.spec.venues.length;
+  const cutoff = tape[0].timestamp - 6e4;
+  const latest = /* @__PURE__ */ new Map();
+  for (const t of tape) {
+    if (t.timestamp < cutoff || latest.size >= wanted) break;
+    if (!latest.has(t.venue)) latest.set(t.venue, t.price);
+  }
+  const prices = [...latest.values()].sort((a, b) => a - b);
+  const m = prices.length >> 1;
+  const price = prices.length % 2 ? prices[m] : (prices[m - 1] + prices[m]) / 2;
+  return { price, print: tape[0].price, printVenue: tape[0].venue, venues: prices.length };
+}
+function sigmaFromVwapOf(market) {
+  const session = market.state.session;
+  const ref = referenceLast(market);
+  if (!session || !ref || !(session.vwapStd > 0)) return null;
+  return (ref.price - session.vwap) / session.vwapStd;
+}
+function referenceQuote(market) {
+  const books = [...market.manager.getBooks().values()].filter((b) => b.bids[0] && b.asks[0]);
+  if (!books.length) return null;
+  const median = (xs) => {
+    const s = [...xs].sort((a, b) => a - b);
+    const m = s.length >> 1;
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  };
+  const mids = books.map((b) => (b.bids[0].price + b.asks[0].price) / 2);
+  const spreads = books.map((b) => (b.asks[0].price - b.bids[0].price) / ((b.asks[0].price + b.bids[0].price) / 2) * 1e4);
+  const agg = market.state.aggregatedBook;
+  const crossed = !!agg && agg.bids[0] && agg.asks[0] ? agg.bids[0].price >= agg.asks[0].price : false;
+  return {
+    mid: median(mids),
+    spread_bps: median(spreads),
+    best_bid: Math.max(...books.map((b) => b.bids[0].price)),
+    best_ask: Math.min(...books.map((b) => b.asks[0].price)),
+    crossed,
+    venues: books.length
+  };
+}
+function allBars(market) {
+  const s = market.state;
+  return s.liveBar ? [...s.flowBars, s.liveBar] : [...s.flowBars];
+}
+function now(market) {
+  return market.state.marketClock || Date.now();
+}
+function flowWindow(market, windowMs) {
+  const bars = allBars(market);
+  const since = now(market) - windowMs;
+  let volume = 0, buy = 0, sell = 0, trades = 0, notional = 0;
+  let first = null, last = null;
+  let high = -Infinity, low = Infinity;
+  for (let i = bars.length - 1; i >= 0 && bars[i].time >= since; i--) {
+    const b = bars[i];
+    if (!last) last = b;
+    first = b;
+    volume += b.volume;
+    buy += b.buyVolume;
+    sell += b.sellVolume;
+    trades += b.trades;
+    notional += b.volume * b.close;
+    if (b.trades) {
+      high = Math.max(high, b.high);
+      low = Math.min(low, b.low);
+    }
+  }
+  if (!first || !last) return null;
+  const covered = Math.min(windowMs, last.time - first.time + 1e3);
+  return {
+    covered_s: Math.round(covered / 1e3),
+    volume: sig(volume),
+    notional_usd: usd(notional),
+    notional_raw: notional,
+    buy_volume: sig(buy),
+    sell_volume: sig(sell),
+    delta: sig(buy - sell),
+    buy_pct: volume ? fixed(buy / volume * 100, 1) : null,
+    trades,
+    price_change_pct: first.open ? pct((last.close - first.open) / first.open) : null,
+    high: Number.isFinite(high) ? high : null,
+    low: Number.isFinite(low) ? low : null
+  };
+}
+function publicWindow(w) {
+  if (!w) return null;
+  const { notional_raw: _raw, ...rest } = w;
+  return rest;
+}
+function latestVolumeZ(market, seconds, window = 20) {
+  const bars = resampleBars(market.state.flowBars, seconds);
+  if (bars.length < 5) return null;
+  const z2 = rollingVolumeZScores(bars, window);
+  return fixed(z2[z2.length - 1]?.z ?? null, 2);
+}
+function realizedVol(market, seconds, window) {
+  const bars = resampleBars(market.state.flowBars, seconds);
+  if (bars.length < 12) return null;
+  const rv = rollingRealizedVolatility(bars, window, seconds, secondsPerYear(market.spec.marketType));
+  return fixed(rv[rv.length - 1]?.value ?? null, 1);
+}
+function depthWithin(market, mid, bands) {
+  const sides = market.manager.getDepthSides();
+  const out = bands.map((band) => ({ band_pct: band * 100, bid: 0, ask: 0 }));
+  for (const side of sides.values()) {
+    for (const [price, size] of side.bids) {
+      const d = (mid - price) / mid;
+      for (let i = 0; i < bands.length; i++) if (d >= 0 && d <= bands[i]) out[i].bid += size;
+    }
+    for (const [price, size] of side.asks) {
+      const d = (price - mid) / mid;
+      for (let i = 0; i < bands.length; i++) if (d >= 0 && d <= bands[i]) out[i].ask += size;
+    }
+  }
+  return out.map((b) => ({
+    band_pct: b.band_pct,
+    bid_size: sig(b.bid),
+    ask_size: sig(b.ask),
+    bid_usd: usd(b.bid * mid),
+    ask_usd: usd(b.ask * mid),
+    imbalance: b.bid + b.ask ? fixed((b.bid - b.ask) / (b.bid + b.ask), 3) : null
+  }));
+}
+function snapshotView(market) {
+  const s = market.state;
+  const p = pricer(market);
+  const session = s.session;
+  const book = s.aggregatedBook;
+  const quote = referenceQuote(market);
+  const profile = s.volumeProfile;
+  const ref = referenceLast(market);
+  const last = ref?.price ?? session?.last ?? s.ticker?.price ?? null;
+  const t = now(market);
+  const sigmaFromVwap = sigmaFromVwapOf(market);
+  const valueLocation = profile && last ? last > profile.vah ? "above_value_area" : last < profile.val ? "below_value_area" : "inside_value_area" : null;
+  const deriv = s.derivatives;
+  const oi5 = oiWindowChange(s.oiHistory, 5 * 6e4);
+  const liq5 = summarizeLiquidations(s.liquidations, t - 5 * 6e4);
+  const big5 = s.bigTrades.filter((b) => b.timestamp >= t - 5 * 6e4);
+  const micro = s.microEvents.filter((e) => e.time >= t - 15 * 6e4).slice(-5).reverse();
+  const w1 = flowWindow(market, 6e4);
+  const w5 = flowWindow(market, 5 * 6e4);
+  const w15 = flowWindow(market, 15 * 6e4);
+  const volZ1m = latestVolumeZ(market, 60);
+  const bandDepth = quote?.mid ? depthWithin(market, quote.mid, [1e-3, 5e-3, 0.01]) : null;
+  const signals = [];
+  if (sigmaFromVwap !== null) {
+    if (sigmaFromVwap >= 2) signals.push(`Price is ${sigmaFromVwap.toFixed(1)}\u03C3 above session VWAP (stretched).`);
+    else if (sigmaFromVwap <= -2) signals.push(`Price is ${Math.abs(sigmaFromVwap).toFixed(1)}\u03C3 below session VWAP (stretched).`);
+    else signals.push(`Price is ${sigmaFromVwap >= 0 ? "above" : "below"} session VWAP (${sigmaFromVwap.toFixed(2)}\u03C3).`);
+  }
+  if (valueLocation) signals.push(`Price is ${valueLocation.replace(/_/g, " ")} (VAL ${p(profile.val)} \u2013 VAH ${p(profile.vah)}, POC ${p(profile.poc)}).`);
+  if (w5 && w5.buy_pct !== null) {
+    if (w5.buy_pct >= 60) signals.push(`Aggressive buyers dominate the last 5m (${w5.buy_pct}% of volume).`);
+    else if (w5.buy_pct <= 40) signals.push(`Aggressive sellers dominate the last 5m (${(100 - w5.buy_pct).toFixed(1)}% of volume).`);
+    const pc = w5.price_change_pct ?? 0;
+    if (w5.delta !== null && Math.abs(pc) > 0.05 && Math.sign(pc) !== Math.sign(w5.delta)) {
+      signals.push(`Delta divergence over 5m: price ${pc > 0 ? "up" : "down"} ${Math.abs(pc)}% while delta is ${w5.delta > 0 ? "positive" : "negative"}.`);
+    }
+  }
+  if (volZ1m !== null && volZ1m >= 2.5) signals.push(`Volume spike: last 1m volume z-score ${volZ1m}.`);
+  if (s.currentOBI >= 0.3) signals.push(`Order book is bid-heavy near the touch (OBI ${s.currentOBI.toFixed(2)}).`);
+  else if (s.currentOBI <= -0.3) signals.push(`Order book is ask-heavy near the touch (OBI ${s.currentOBI.toFixed(2)}).`);
+  if (oi5 && oi5.regime !== "neutral") signals.push(`OI regime (5m): ${OI_REGIME_LABEL[oi5.regime]} \u2014 ${OI_REGIME_HINT[oi5.regime]}`);
+  if (deriv?.fundingRate8h !== null && deriv?.fundingRate8h !== void 0 && Math.abs(deriv.fundingRate8h) >= 3e-4) {
+    signals.push(`Funding is elevated: ${(deriv.fundingRate8h * 100).toFixed(4)}% per 8h (${deriv.fundingRate8h > 0 ? "longs pay shorts" : "shorts pay longs"}).`);
+  }
+  if (liq5.count) signals.push(`Liquidations last 5m: longs ${usd(liq5.longNotional)}, shorts ${usd(liq5.shortNotional)}.`);
+  for (const e of micro.slice(0, 2)) {
+    signals.push(`${e.kind === "absorption" ? "Absorption" : "Iceberg"} at ${p(e.price)}: the ${e.side === "bid" ? "bid held against selling" : "offer held against buying"} (${iso(e.time)}).`);
+  }
+  return {
+    ...header(market),
+    price: {
+      last: p(last),
+      ...ref && market.spec.venues.length > 1 ? { last_note: `median of ${ref.venues} venues' latest prints`, last_print: p(ref.print), last_print_venue: ref.printVenue } : {},
+      mid: p(quote?.mid),
+      spread_bps: fixed(quote?.spread_bps, 2),
+      ...quote && quote.venues > 1 ? {
+        highest_bid: p(quote.best_bid),
+        lowest_ask: p(quote.best_ask),
+        ...quote.crossed ? { cross_venue_crossed: true } : {}
+      } : { best_bid: p(quote?.best_bid), best_ask: p(quote?.best_ask) }
+    },
+    session: session ? {
+      open: p(session.open),
+      high: p(session.high),
+      low: p(session.low),
+      change_pct: session.open && last ? pct((last - session.open) / session.open) : null,
+      vwap: p(session.vwap),
+      vwap_std: p(session.vwapStd),
+      sigma_from_vwap: fixed(sigmaFromVwap, 2),
+      volume: sig(session.volume),
+      notional_usd: usd(session.notional),
+      buy_volume: sig(session.buyVolume),
+      sell_volume: sig(session.sellVolume),
+      delta: sig(session.buyVolume - session.sellVolume),
+      buy_pct: session.volume ? fixed(session.buyVolume / session.volume * 100, 1) : null,
+      trades: session.trades,
+      avg_trade: sig(session.volume / Math.max(1, session.trades)),
+      max_trade: sig(session.maxTrade)
+    } : null,
+    flow: { last_1m: publicWindow(w1), last_5m: publicWindow(w5), last_15m: publicWindow(w15), volume_z_1m: volZ1m, realized_vol_5m_ann_pct: realizedVol(market, 5, 60) },
+    volume_profile: profile ? { poc: p(profile.poc), vah: p(profile.vah), val: p(profile.val), location: valueLocation } : null,
+    order_book: book ? { obi: fixed(s.currentOBI, 3), obi_note: "obi = (bid\u2212ask)/(bid+ask) size near the touch, within the shallowest venue's displayed depth; depth = all resting size within each band of mid", depth: bandDepth } : null,
+    derivatives: market.spec.marketType === "perpetual" && deriv ? {
+      open_interest: sig(deriv.openInterest),
+      open_interest_usd: usd(deriv.openInterestValue),
+      oi_change_5m_pct: oi5 ? pct(oi5.oiChange) : null,
+      oi_regime_5m: oi5 ? oi5.regime : null,
+      funding_8h_pct: pct(deriv.fundingRate8h, 5),
+      funding_annualized_pct: deriv.fundingRate8h !== null ? fixed(annualizeFunding(deriv.fundingRate8h, 8) * 100, 2) : null,
+      next_funding: iso(deriv.nextFundingTime),
+      mark: p(deriv.markPrice),
+      index: p(deriv.indexPrice),
+      basis_bps: fixed(deriv.basisBps, 2)
+    } : null,
+    liquidations_5m: market.spec.marketType === "perpetual" ? { long_usd: usd(liq5.longNotional), short_usd: usd(liq5.shortNotional), count: liq5.count } : null,
+    big_trades_5m: {
+      count: big5.length,
+      buy_usd: usd(big5.filter((b) => b.side === "buy").reduce((a, b) => a + b.quoteVolume, 0)),
+      sell_usd: usd(big5.filter((b) => b.side === "sell").reduce((a, b) => a + b.quoteVolume, 0))
+    },
+    recent_micro_events: micro.map((e) => microRow(e, p)),
+    signals,
+    connections: connectionsView(market)
+  };
+}
+function groupLevels(candle, rowSize) {
+  const rows = /* @__PURE__ */ new Map();
+  for (const l of candle.levels.values()) {
+    const key2 = Math.floor(l.price / rowSize + 1e-9) * rowSize;
+    const r = rows.get(key2) ?? { price: key2, bid: 0, ask: 0, trades: 0 };
+    r.bid += l.bidVolume;
+    r.ask += l.askVolume;
+    r.trades += l.tradeCount;
+    rows.set(key2, r);
+  }
+  return [...rows.values()].sort((a, b) => b.price - a.price);
+}
+function footprintView(market, o) {
+  const p = pricer(market);
+  const tick = market.manager.tickSize || 1;
+  const candles = market.candles(o.timeframe).slice(-o.candles);
+  const out = candles.map((c) => {
+    const span = Math.max(1, Math.round((c.high - c.low) / tick) + 1);
+    const ticksPerRow = o.rowTicks ?? Math.max(1, Math.ceil(span / o.maxRows));
+    const rowSize = Number((ticksPerRow * tick).toPrecision(10));
+    const rows = groupLevels(c, rowSize);
+    let poc = null;
+    for (const r of rows) if (!poc || r.bid + r.ask > poc.bid + poc.ask) poc = r;
+    const pseudo = {
+      ...c,
+      levels: new Map(rows.map((r) => [r.price, { price: r.price, bidVolume: r.bid, askVolume: r.ask }])),
+      sortedPrices: rows.map((r) => r.price).sort((a, b) => a - b)
+    };
+    const stacked = stackedRuns(pseudo, o.imbalanceRatio, o.stackedLevels);
+    return {
+      open_time: iso(c.openTime),
+      complete: c.complete,
+      open: p(c.open),
+      high: p(c.high),
+      low: p(c.low),
+      close: p(c.close),
+      volume: sig(c.volume),
+      delta: sig(c.delta),
+      delta_pct: c.volume ? fixed(c.delta / c.volume * 100, 1) : null,
+      cvd: sig(c.cumulativeDelta),
+      trades: c.tradeCount,
+      poc: poc ? p(poc.price) : null,
+      vwap: p(c.vwap),
+      row_size: rowSize,
+      stacked_imbalances: stacked.map((r) => ({ side: r.dir, from: p(r.start), to: p(r.end) })),
+      ...o.includeRows ? {
+        rows: rows.map((r) => {
+          const imb = imbalanceOf({ bidVolume: r.bid, askVolume: r.ask }, o.imbalanceRatio);
+          return [p(r.price), sig(r.bid, 4), sig(r.ask, 4), sig(r.ask - r.bid, 4), r.trades, imb ?? ""];
+        })
+      } : {}
+    };
+  });
+  return {
+    ...header(market),
+    timeframe: o.timeframe,
+    imbalance_ratio: o.imbalanceRatio,
+    ...o.includeRows ? { row_columns: ["price_low", "bid_vol(sells)", "ask_vol(buys)", "delta", "trades", "imbalance"] } : {},
+    note: "Rows run high\u2192low price. bid_vol = volume sold into the bid, ask_vol = volume bought at the ask. 'buy'/'sell' imbalance = one side \u2265 ratio\xD7 the other at that row.",
+    candles: out
+  };
+}
+function volumeProfileView(market, rows, valueAreaPct) {
+  const p = pricer(market);
+  const base = market.baseCandles();
+  const profile = base.length ? computeVolumeProfile(base, valueAreaPct) : null;
+  if (!profile || !profile.levels.length) return { ...header(market), profile: null };
+  const tick = market.manager.tickSize || 1;
+  const prices = profile.levels.map((l) => l.price);
+  const lo = Math.min(...prices), hi = Math.max(...prices);
+  const ticksPerRow = Math.max(1, Math.ceil((Math.round((hi - lo) / tick) + 1) / rows));
+  const rowSize = Number((ticksPerRow * tick).toPrecision(10));
+  const grouped = /* @__PURE__ */ new Map();
+  for (const l of profile.levels) {
+    const key2 = Math.floor(l.price / rowSize + 1e-9) * rowSize;
+    const g = grouped.get(key2) ?? { vol: 0, bid: 0, ask: 0 };
+    g.vol += l.totalVolume;
+    g.bid += l.bidVolume;
+    g.ask += l.askVolume;
+    grouped.set(key2, g);
+  }
+  const list = [...grouped.entries()].sort((a, b) => b[0] - a[0]);
+  const maxVol = Math.max(...list.map(([, g]) => g.vol));
+  const byVol = [...list].sort((a, b) => b[1].vol - a[1].vol);
+  return {
+    ...header(market),
+    value_area_pct: valueAreaPct * 100,
+    poc: p(profile.poc),
+    vah: p(profile.vah),
+    val: p(profile.val),
+    total_volume: sig(profile.totalVolume),
+    buy_volume: sig(profile.buyVolume),
+    sell_volume: sig(profile.sellVolume),
+    delta: sig(profile.delta),
+    high_volume_nodes: byVol.slice(0, 5).map(([price]) => p(price)),
+    row_size: rowSize,
+    columns: ["price_low", "volume", "buy_vol", "sell_vol", "delta", "pct_of_max"],
+    rows: list.map(([price, g]) => [p(price), sig(g.vol, 4), sig(g.ask, 4), sig(g.bid, 4), sig(g.ask - g.bid, 4), Math.round(g.vol / maxVol * 100)])
+  };
+}
+function groupBook(levels, step, side, depth) {
+  const map = /* @__PURE__ */ new Map();
+  for (const l of levels) {
+    const key2 = side === "bid" ? Math.floor(l.price / step + 1e-9) * step : Math.ceil(l.price / step - 1e-9) * step;
+    map.set(key2, (map.get(key2) ?? 0) + l.size);
+  }
+  return [...map.entries()].sort((a, b) => side === "bid" ? b[0] - a[0] : a[0] - b[0]).slice(0, depth);
+}
+function orderBookView(market, depth, groupTicks, perVenue) {
+  const p = pricer(market);
+  const book = market.state.aggregatedBook;
+  const quote = referenceQuote(market);
+  if (!book || !quote) return { ...header(market), order_book: null, connections: connectionsView(market) };
+  const mid = quote.mid;
+  const tick = market.manager.tickSize || 0;
+  const step = groupTicks > 0 && tick > 0 ? Number((tick * groupTicks).toPrecision(10)) : 0;
+  const bids = step ? groupBook(book.bids, step, "bid", depth) : book.bids.slice(0, depth).map((l) => [l.price, l.size]);
+  const asks = step ? groupBook(book.asks, step, "ask", depth) : book.asks.slice(0, depth).map((l) => [l.price, l.size]);
+  const sizes = [...book.bids, ...book.asks].map((l) => l.size).sort((a, b) => a - b);
+  const median = sizes[Math.floor(sizes.length / 2)] || 0;
+  const walls = [...book.bids.map((l) => ({ ...l, side: "bid" })), ...book.asks.map((l) => ({ ...l, side: "ask" }))].filter((l) => median > 0 && l.size >= median * 5).sort((a, b) => b.size - a.size).slice(0, 8).map((l) => ({ side: l.side, price: p(l.price), size: sig(l.size, 4), usd: usd(l.size * l.price), x_median: fixed(l.size / median, 1), distance_bps: fixed((l.price - mid) / mid * 1e4, 1) }));
+  let cb = 0, ca = 0;
+  const venues = perVenue ? [...market.manager.getBooks().values()].map((b) => ({
+    venue: b.venue,
+    best_bid: p(b.bids[0]?.price),
+    best_ask: p(b.asks[0]?.price),
+    spread_bps: b.bids[0] && b.asks[0] ? fixed((b.asks[0].price - b.bids[0].price) / ((b.asks[0].price + b.bids[0].price) / 2) * 1e4, 2) : null,
+    bid_size_top10: sig(b.bids.slice(0, 10).reduce((a, l) => a + l.size, 0), 4),
+    ask_size_top10: sig(b.asks.slice(0, 10).reduce((a, l) => a + l.size, 0), 4),
+    levels_held: b.bids.length + b.asks.length,
+    updated_s_ago: fixed((Date.now() - b.localTimestamp) / 1e3, 1)
+  })) : void 0;
+  return {
+    ...header(market),
+    mid: p(mid),
+    spread_bps: fixed(quote.spread_bps, 2),
+    ...quote.crossed ? { cross_venue_crossed: true, crossed_note: "Venues quote in USDT, USDC or USD, so the summed book overlaps by a few bps at the touch. mid and spread_bps are medians of each venue's own quote." } : {},
+    obi: fixed(market.state.currentOBI, 3),
+    group_size: step || "raw",
+    columns: ["price", "size", "cumulative_size"],
+    bids: bids.map(([price, size]) => [p(price), sig(size, 5), sig(cb += size, 5)]),
+    asks: asks.map(([price, size]) => [p(price), sig(size, 5), sig(ca += size, 5)]),
+    depth_bands: depthWithin(market, mid, [1e-3, 25e-4, 5e-3, 0.01, 0.02]),
+    walls,
+    ...venues ? { venues } : {},
+    note: "Sizes are base-asset units summed across the venue selection. walls = single price levels \u22655\xD7 the median level size."
+  };
+}
+function tradesView(market, limit, minNotional, side, venue) {
+  const p = pricer(market);
+  const tape = market.manager.getTapeLog();
+  const rows = [];
+  for (const t of tape) {
+    if (rows.length >= limit) break;
+    if (t.quoteVolume < minNotional) continue;
+    if (side && t.side !== side) continue;
+    if (venue && t.venue !== venue) continue;
+    rows.push([iso(t.timestamp), t.venue, t.side, p(t.price), sig(t.quantity), sig(t.quoteVolume, 4)]);
+  }
+  return {
+    ...header(market),
+    tape_size: tape.length,
+    columns: ["time", "venue", "aggressor", "price", "qty", "notional_usd"],
+    trades: rows,
+    note: "Newest first. aggressor 'buy' = market buy lifting the offer."
+  };
+}
+function bigTradesView(market, limit, minRatio, windowMinutes) {
+  const p = pricer(market);
+  const since = now(market) - windowMinutes * 6e4;
+  const list = market.state.bigTrades.filter((b) => b.ratio >= minRatio && b.timestamp >= since);
+  const buy = list.filter((b) => b.side === "buy");
+  const sell = list.filter((b) => b.side === "sell");
+  const session = market.state.session;
+  return {
+    ...header(market),
+    window_minutes: windowMinutes,
+    min_ratio: minRatio,
+    average_print: session ? sig(session.volume / Math.max(1, session.trades)) : null,
+    summary: {
+      count: list.length,
+      buy_count: buy.length,
+      sell_count: sell.length,
+      buy_usd: usd(buy.reduce((a, b) => a + b.quoteVolume, 0)),
+      sell_usd: usd(sell.reduce((a, b) => a + b.quoteVolume, 0))
+    },
+    columns: ["time", "venue", "aggressor", "price", "qty", "notional_usd", "x_avg_print"],
+    trades: list.slice(-limit).reverse().map((b) => [iso(b.timestamp), b.venue, b.side, p(b.price), sig(b.quantity), sig(b.quoteVolume, 4), fixed(b.ratio, 1)]),
+    note: "Prints at least min_ratio\xD7 the session's average print size (counted after a 50-trade warm-up). Newest first."
+  };
+}
+function flowSeriesView(market, intervalSeconds, bars, zWindow) {
+  const p = pricer(market);
+  const resampled = resampleBars(allBars(market), intervalSeconds);
+  const z2 = rollingVolumeZScores(resampled, zWindow);
+  const rv = rollingRealizedVolatility(resampleBars(market.state.flowBars, 1), 300, 1, secondsPerYear(market.spec.marketType));
+  const start = Math.max(0, resampled.length - bars);
+  return {
+    ...header(market),
+    interval_s: intervalSeconds,
+    volume_z_window: zWindow,
+    realized_vol_5m_ann_pct: fixed(rv[rv.length - 1]?.value ?? null, 1),
+    session_cvd: sig(resampled[resampled.length - 1]?.cvd ?? null),
+    columns: ["time", "open", "high", "low", "close", "volume", "buy_vol", "sell_vol", "delta", "cvd", "trades", "volume_z"],
+    bars: resampled.slice(start).map((b, i) => [
+      iso(b.time),
+      p(b.open),
+      p(b.high),
+      p(b.low),
+      p(b.close),
+      sig(b.volume, 4),
+      sig(b.buyVolume, 4),
+      sig(b.sellVolume, 4),
+      sig(b.buyVolume - b.sellVolume, 4),
+      sig(b.cvd, 5),
+      b.trades,
+      fixed(z2[start + i]?.z ?? null, 2)
+    ]),
+    note: "Oldest first. cvd = cumulative (buy \u2212 sell) volume since streaming began. The last bar may still be forming."
+  };
+}
+function derivativesView(market, historyMinutes) {
+  const p = pricer(market);
+  const s = market.state;
+  if (market.spec.marketType !== "perpetual") {
+    return { ...header(market), derivatives: null, note: "Open interest and funding exist for perpetuals only (market_type=perp)." };
+  }
+  const d = s.derivatives;
+  const windows = [1, 5, 15, 60].map((m) => {
+    const c = oiWindowChange(s.oiHistory, m * 6e4);
+    return c ? { window_m: m, oi_change_pct: pct(c.oiChange), oi_change: sig(c.oiDelta), price_change_pct: pct(c.priceChange), regime: c.regime, meaning: OI_REGIME_HINT[c.regime] } : { window_m: m, oi_change_pct: null };
+  });
+  const minute = /* @__PURE__ */ new Map();
+  for (const pt of s.oiHistory) minute.set(Math.floor(pt.time / 6e4) * 6e4, { oi: pt.openInterest, price: pt.price });
+  const series = [...minute.entries()].slice(-historyMinutes);
+  return {
+    ...header(market),
+    aggregate: d ? {
+      open_interest: sig(d.openInterest),
+      open_interest_usd: usd(d.openInterestValue),
+      funding_8h_pct: pct(d.fundingRate8h, 5),
+      funding_annualized_pct: d.fundingRate8h !== null ? fixed(annualizeFunding(d.fundingRate8h, 8) * 100, 2) : null,
+      next_funding: iso(d.nextFundingTime),
+      mark: p(d.markPrice),
+      index: p(d.indexPrice),
+      basis_bps: fixed(d.basisBps, 2)
+    } : null,
+    oi_changes: windows,
+    venues: (d?.venues ?? []).map((v) => ({
+      venue: v.venue,
+      open_interest: sig(v.openInterest ?? null),
+      funding_pct: pct(v.fundingRate ?? null, 5),
+      funding_interval_h: v.fundingIntervalHours ?? null,
+      next_funding: iso(v.nextFundingTime),
+      mark: p(v.markPrice),
+      index: p(v.indexPrice)
+    })),
+    oi_history_columns: ["minute", "open_interest", "price"],
+    oi_history: series.map(([t, v]) => [iso(t), sig(v.oi, 6), p(v.price)]),
+    note: "OI is in base units, summed over venues that report it; funding and basis are OI-weighted. funding_8h normalizes each venue to an 8h interval."
+  };
+}
+function liquidationsView(market, windowMinutes, limit) {
+  const p = pricer(market);
+  const s = market.state;
+  const t = now(market);
+  if (market.spec.marketType !== "perpetual") {
+    return { ...header(market), liquidations: null, note: "Liquidations exist for perpetuals only (market_type=perp)." };
+  }
+  const summary = summarizeLiquidations(s.liquidations, t - windowMinutes * 6e4);
+  const buckets = bucketLiquidations(s.liquidations, 6e4, Math.min(windowMinutes, 240), t);
+  const feeds = market.spec.venues.filter((v) => LIQUIDATION_FEED_VENUES.has(v));
+  return {
+    ...header(market),
+    window_minutes: windowMinutes,
+    venues_with_liquidation_feed: feeds,
+    summary: {
+      long_liquidated_usd: usd(summary.longNotional),
+      short_liquidated_usd: usd(summary.shortNotional),
+      count: summary.count,
+      largest: summary.largest ? { time: iso(summary.largest.timestamp), venue: summary.largest.venue, side: summary.largest.side, price: p(summary.largest.price), usd: usd(summary.largest.quoteVolume) } : null,
+      cascade_now: isLiquidationCascade(buckets, 5, 1e5)
+    },
+    per_minute_columns: ["minute", "long_usd", "short_usd", "count"],
+    per_minute: buckets.filter((b) => b.count).map((b) => [iso(b.time), sig(b.longNotional, 4), sig(b.shortNotional, 4), b.count]),
+    recent_columns: ["time", "venue", "liquidated_side", "price", "qty", "usd"],
+    recent: s.liquidations.slice(-limit).reverse().map((l) => [iso(l.timestamp), l.venue, l.side, p(l.price), sig(l.quantity), sig(l.quoteVolume, 4)]),
+    note: "liquidated_side 'long' = a long was force-closed (forced sell). Coverage depends on which venues publish a liquidation stream."
+  };
+}
+function microRow(e, p) {
+  return {
+    kind: e.kind,
+    side: e.side,
+    meaning: e.kind === "absorption" ? e.side === "bid" ? "passive bids absorbed aggressive selling (support)" : "passive offers absorbed aggressive buying (resistance)" : e.side === "bid" ? "hidden bid refilled (iceberg buyer)" : "hidden offer refilled (iceberg seller)",
+    price: p(e.price),
+    time: iso(e.time),
+    duration_s: fixed((e.time - e.start) / 1e3, 1),
+    volume: sig(e.volume),
+    notional_usd: usd(e.notional),
+    ratio: fixed(e.ratio, 2),
+    ...e.venue ? { venue: e.venue } : {}
+  };
+}
+function microView(market, kind, limit, windowMinutes) {
+  const p = pricer(market);
+  const since = now(market) - windowMinutes * 6e4;
+  const events = market.state.microEvents.filter((e) => e.time >= since && (kind === "all" || e.kind === kind));
+  return {
+    ...header(market),
+    window_minutes: windowMinutes,
+    count: events.length,
+    events: events.slice(-limit).reverse().map((e) => microRow(e, p)),
+    definitions: {
+      absorption: "In a 10s window, aggressive volume at one price \u2265 an average window's total and \u226550% of that side's flow, while price moved \u22641 tick through the level.",
+      iceberg: "On one venue, more than 1.5\xD7 the displayed size (and \u226510\xD7 the average print) traded at a level that kept refilling."
+    }
+  };
+}
+function venuesView(market) {
+  const p = pricer(market);
+  const s = market.state;
+  if (market.spec.venues.length < 2) {
+    return { ...header(market), venues: null, note: "Venue comparison needs a multi-venue selection (venue='all')." };
+  }
+  const summary = venueSummary(s.venueBuckets, now(market));
+  return {
+    ...header(market),
+    window_s: 60,
+    leader: summary.leader ? { venue: summary.leader.venue, lead_ms: summary.leader.leadMs, corr: fixed(summary.leader.leadCorr, 2) } : null,
+    columns: ["venue", "last", "premium_bps", "volume_60s", "share_pct", "delta_60s", "lead_ms", "lead_corr"],
+    venues: summary.stats.map((v) => [v.venue, p(v.last), fixed(v.premiumBps, 2), sig(v.volume, 4), fixed(v.share * 100, 1), sig(v.delta, 4), v.leadMs, fixed(v.leadCorr, 2)]),
+    connections: connectionsView(market),
+    note: "premium vs the median venue price. lead_ms > 0: that venue's price moves first by that many ms (lagged return correlation over the last 2.5 min)."
+  };
+}
+function heatmapView(market, minutes, rows, columns) {
+  const p = pricer(market);
+  const h = market.manager.depthHistory;
+  const t = now(market);
+  const from = h.seqAtOrAfter(t - minutes * 6e4);
+  const to = h.lastSeq;
+  if (to < from || h.size === 0) return { ...header(market), heatmap: null, note: "No depth snapshots yet (sampled once a second once trades and books arrive)." };
+  const tick = h.tick;
+  const mid = referenceQuote(market)?.mid || referenceLast(market)?.price || 0;
+  const band = 0.01;
+  const lo = mid * (1 - band), hi = mid * (1 + band);
+  const ticksPerRow = Math.max(1, Math.ceil((hi - lo) / tick / rows));
+  const rowSize = Number((ticksPerRow * tick).toPrecision(10));
+  const rowOf = (price) => Math.floor(price / rowSize + 1e-9) * rowSize;
+  const firstTime = h.get(from).time;
+  const span = Math.max(1, h.get(to).time - firstTime + 1e3);
+  const colMs = Math.ceil(span / columns / 1e3) * 1e3;
+  const grid2 = /* @__PURE__ */ new Map();
+  const colCount = Math.ceil(span / colMs);
+  const samples = new Array(colCount).fill(0);
+  for (let seq = from; seq <= to; seq++) {
+    const snap = h.get(seq);
+    if (!snap) continue;
+    const col = Math.min(colCount - 1, Math.floor((snap.time - firstTime) / colMs));
+    samples[col]++;
+    for (let i = 0; i < snap.index.length; i++) {
+      const price = snap.index[i] * tick;
+      if (price < lo || price > hi) continue;
+      const r = rowOf(price);
+      let cell2 = grid2.get(r);
+      if (!cell2) {
+        cell2 = { sum: new Array(colCount).fill(0), n: [] };
+        grid2.set(r, cell2);
+      }
+      cell2.sum[col] += snap.size[i];
+    }
+  }
+  const list = [...grid2.entries()].sort((a, b) => b[0] - a[0]).map(([price, cell2]) => {
+    const avg = cell2.sum.map((v, i) => samples[i] ? v / samples[i] : 0);
+    return { price, avg };
+  });
+  const overall = list.map((r) => ({ price: r.price, mean: r.avg.reduce((a, b) => a + b, 0) / colCount, first: r.avg[0], last: r.avg[colCount - 1] }));
+  const sorted = [...overall].sort((a, b) => b.mean - a.mean);
+  const median = [...overall].map((r) => r.mean).sort((a, b) => a - b)[Math.floor(overall.length / 2)] || 0;
+  const walls = sorted.slice(0, 8).map((r) => ({
+    price: p(r.price),
+    side: r.price < mid ? "bid" : "ask",
+    avg_size: sig(r.mean, 4),
+    x_median: median ? fixed(r.mean / median, 1) : null,
+    change_pct: r.first > 0 ? fixed((r.last - r.first) / r.first * 100, 0) : null,
+    trend: r.first > 0 && r.last < r.first * 0.5 ? "pulled" : r.last > r.first * 1.5 ? "added" : "stable"
+  }));
+  return {
+    ...header(market),
+    minutes,
+    mid: p(mid),
+    row_size: rowSize,
+    column_s: colMs / 1e3,
+    column_times: Array.from({ length: colCount }, (_, i) => iso(firstTime + i * colMs)),
+    persistent_walls: walls,
+    columns: ["price_low", "avg_resting_size_per_column\u2026"],
+    rows: list.map((r) => [p(r.price), ...r.avg.map((v) => sig(v, 3))]),
+    note: "Average resting order-book size (base units, all selected venues) per price row and time column, within \xB11% of mid. trend compares the first and last column."
+  };
+}
+function cascadeNow(market, windowMinutes = 30) {
+  if (market.spec.marketType !== "perpetual") return false;
+  const buckets = bucketLiquidations(market.state.liquidations, 6e4, windowMinutes, now(market));
+  return isLiquidationCascade(buckets, 5, 1e5);
+}
+function scanRow(m, last = referenceLast(m)?.price) {
+  const s = m.state;
+  const t = s.marketClock || Date.now();
+  const w5 = flowWindow(m, 5 * 6e4);
+  const sigma = sigmaFromVwapOf(m);
+  const bars = s.flowBars;
+  let volumeZ = null;
+  if (bars.length > 120) {
+    const minutes = /* @__PURE__ */ new Map();
+    for (const b of bars) minutes.set(Math.floor(b.time / 6e4), (minutes.get(Math.floor(b.time / 6e4)) ?? 0) + b.volume);
+    const vols = [...minutes.values()];
+    const lastVolume = vols[vols.length - 2];
+    const base = vols.slice(Math.max(0, vols.length - 22), -2);
+    if (base.length >= 3 && lastVolume !== void 0) {
+      const mean = base.reduce((a, b) => a + b, 0) / base.length;
+      const sd = Math.sqrt(base.reduce((a, b) => a + (b - mean) ** 2, 0) / (base.length - 1));
+      volumeZ = sd > 0 ? (lastVolume - mean) / sd : 0;
+    }
+  }
+  const oi5 = oiWindowChange(s.oiHistory, 5 * 6e4);
+  const liq = summarizeLiquidations(s.liquidations, t - 5 * 6e4);
+  return {
+    symbol: m.spec.symbol,
+    ready: m.ready,
+    stream_age_s: Math.round(m.ageMs / 1e3),
+    last: sig(last, 8),
+    change_5m_pct: w5?.price_change_pct ?? null,
+    delta_5m: w5?.delta ?? null,
+    buy_pct_5m: w5?.buy_pct ?? null,
+    notional_5m_usd: w5 ? Math.round(w5.notional_raw) : null,
+    volume_z_1m: fixed(volumeZ, 2),
+    sigma_from_vwap: fixed(sigma, 2),
+    obi: m.ready ? fixed(s.currentOBI, 2) : null,
+    funding_8h_pct: pct(s.derivatives?.fundingRate8h ?? null, 4),
+    oi_change_5m_pct: oi5 ? pct(oi5.oiChange) : null,
+    oi_regime_5m: oi5?.regime ?? null,
+    liquidations_5m_usd: Math.round(liq.longNotional + liq.shortNotional),
+    big_prints_5m: s.bigTrades.filter((b) => b.timestamp >= t - 5 * 6e4).length,
+    live_venues: m.connections().filter((c) => c.status === "live").length + "/" + m.spec.venues.length
+  };
+}
+var pct;
+var init_views = __esm({
+  "src/views.ts"() {
+    "use strict";
+    init_orderFlowEngine();
+    init_imbalance();
+    init_analytics();
+    init_derivatives();
+    init_venues();
+    pct = (x, decimals = 3) => fixed(x === null || x === void 0 ? null : x * 100, decimals);
+  }
+});
+
+// src/screener.ts
+var screener_exports = {};
+__export(screener_exports, {
+  SCREENER_WINDOWS: () => SCREENER_WINDOWS,
+  ScreenerService: () => ScreenerService,
+  listenScreener: () => listenScreener,
+  openInBrowser: () => openInBrowser,
+  screenerEvents: () => screenerEvents,
+  screenerRow: () => screenerRow,
+  screenerSnapshot: () => screenerSnapshot,
+  screenerUrl: () => screenerUrl,
+  sparkline: () => sparkline
+});
+import { createServer } from "http";
+import { spawn } from "child_process";
+function livePrice(market) {
+  return referenceLast(market, market.state.recentTrades)?.price ?? null;
+}
+function sparkline(market, windowMs, points = SPARK_POINTS) {
+  const s = market.state;
+  const end = s.marketClock || Date.now();
+  const span = windowMs > 0 ? windowMs : Math.max(6e4, end - market.startedAt);
+  const start = end - span;
+  const bars = s.liveBar ? [...s.flowBars, s.liveBar] : s.flowBars;
+  const candles = market.baseCandles();
+  const useBars = bars.length > 0 && (bars[0].time <= start + 1e3 || !candles.length || candles[0].openTime >= bars[0].time - 6e4);
+  const series = useBars ? bars.filter((b) => b.time >= start && b.trades > 0) : candles.filter((c) => c.closeTime >= start).map((c) => ({ time: c.openTime, open: c.open, close: c.close }));
+  if (!series.length) return null;
+  const step = span / points;
+  const values = [];
+  let i = 0;
+  let last = null;
+  for (let k = 0; k < points; k++) {
+    const bucketEnd = start + (k + 1) * step;
+    while (i < series.length && series[i].time < bucketEnd) last = series[i++].close;
+    values.push(last);
+  }
+  return { base: series[0].open, values };
+}
+function screenerRow(market, windowMs) {
+  const s = market.state;
+  const last = livePrice(market);
+  const spark2 = sparkline(market, windowMs);
+  const scan = scanRow(market, last ?? void 0);
+  const t = s.marketClock || Date.now();
+  const liq = summarizeLiquidations(s.liquidations, t - 5 * 6e4);
+  const base = market.spec.symbol.replace(/USDT$/, "");
+  const asset = assetFor(market.spec.symbol);
+  const decimals = Math.min(8, getTickDecimals(market.manager.tickSize || 0.01));
+  const baseline = spark2?.base ?? null;
+  return {
+    key: market.spec.key,
+    base,
+    name: asset?.name ?? base,
+    color: asset?.color ?? "#888",
+    market_type: market.spec.marketType === "perpetual" ? "perp" : "spot",
+    venue: market.spec.selection,
+    decimals,
+    ready: market.ready,
+    stream_age_s: scan.stream_age_s,
+    last: sig(last, 10),
+    baseline: sig(baseline, 10),
+    change: last !== null && baseline !== null ? last - baseline : null,
+    change_pct: last !== null && baseline ? fixed((last - baseline) / baseline * 100, 3) : null,
+    spark: spark2?.values.map((v) => v === null ? null : sig(v, 10)) ?? [],
+    delta_5m: scan.delta_5m,
+    buy_pct_5m: scan.buy_pct_5m,
+    notional_5m_usd: scan.notional_5m_usd,
+    volume_z_1m: scan.volume_z_1m,
+    sigma_from_vwap: scan.sigma_from_vwap,
+    obi: scan.obi,
+    funding_8h_pct: scan.funding_8h_pct,
+    oi_change_5m_pct: scan.oi_change_5m_pct,
+    liq_long_5m_usd: Math.round(liq.longNotional),
+    liq_short_5m_usd: Math.round(liq.shortNotional),
+    cascade: cascadeNow(market),
+    big_prints_5m: scan.big_prints_5m,
+    live_venues: scan.live_venues
+  };
+}
+function screenerEvents(markets, limit = 14, windowMs = 15 * 6e4) {
+  const out = [];
+  for (const m of markets) {
+    const s = m.state;
+    const since = (s.marketClock || Date.now()) - windowMs;
+    const base = m.spec.symbol.replace(/USDT$/, "");
+    for (const b of s.bigTrades.slice(-20)) {
+      if (b.timestamp >= since && b.quoteVolume >= 5e4) out.push({ time: b.timestamp, base, kind: "big", side: b.side, text: `${b.side === "buy" ? "Buy" : "Sell"} print ${fixed(b.ratio, 0)}\xD7 avg`, usd: b.quoteVolume });
+    }
+    for (const e of s.microEvents.slice(-10)) {
+      if (e.time >= since) out.push({ time: e.time, base, kind: e.kind, side: e.side === "bid" ? "buy" : "sell", text: e.kind === "absorption" ? e.side === "bid" ? "Bids absorbing sellers" : "Offers absorbing buyers" : e.side === "bid" ? "Iceberg bid" : "Iceberg offer", usd: e.notional });
+    }
+    for (const l of s.liquidations.slice(-50)) {
+      if (l.timestamp >= since && l.quoteVolume >= 1e5) out.push({ time: l.timestamp, base, kind: "liq", side: l.side === "long" ? "sell" : "buy", text: `${l.side === "long" ? "Long" : "Short"} liquidated`, usd: l.quoteVolume });
+    }
+  }
+  return out.sort((a, b) => b.time - a.time).slice(0, limit);
+}
+function screenerSnapshot(hub2, window) {
+  const markets = hub2.list();
+  return {
+    as_of: Date.now(),
+    window,
+    rows: markets.map((m) => screenerRow(m, SCREENER_WINDOWS[window])),
+    events: screenerEvents(markets)
+  };
+}
+function listenScreener(service, host, port) {
+  return new Promise((resolve, reject) => {
+    let attempt = 0;
+    const tryPort = () => {
+      const server = createServer((req, res) => {
+        if (!service.handle(req, res)) {
+          res.writeHead(302, { location: "/screener" }).end();
+        }
+      });
+      server.once("error", (error) => {
+        if (error.code === "EADDRINUSE" && attempt < 9) {
+          attempt++;
+          tryPort();
+        } else reject(error);
+      });
+      server.listen(port === 0 ? 0 : port + attempt, host, () => {
+        server.unref();
+        const bound = server.address();
+        resolve({ url: screenerUrl(host, typeof bound === "object" && bound ? bound.port : port + attempt), server });
+      });
+    };
+    tryPort();
+  });
+}
+function screenerUrl(host, port, token) {
+  const shown = host === "0.0.0.0" || host === "::" ? "localhost" : host.includes(":") ? `[${host}]` : host;
+  return `http://${shown}:${port}/screener${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+}
+function openInBrowser(url) {
+  if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return false;
+  try {
+    const [cmd, args] = process.platform === "darwin" ? ["open", [url]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] : ["xdg-open", [url]];
+    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+    child.on("error", () => {
+    });
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+var SCREENER_WINDOWS, TICK_MS, FULL_MS, SPARK_POINTS, ScreenerService;
+var init_screener = __esm({
+  "src/screener.ts"() {
+    "use strict";
+    init_instruments();
+    init_orderFlowEngine();
+    init_derivatives();
+    init_screener_page();
+    init_views();
+    SCREENER_WINDOWS = { "15m": 15 * 6e4, "1h": 60 * 6e4, "4h": 4 * 60 * 6e4, session: 0 };
+    TICK_MS = 250;
+    FULL_MS = 1e3;
+    SPARK_POINTS = 90;
+    ScreenerService = class {
+      constructor(hub2, token) {
+        this.hub = hub2;
+        this.token = token;
+      }
+      hub;
+      token;
+      clients = /* @__PURE__ */ new Set();
+      tickTimer = null;
+      fullTimer = null;
+      /** Handles /screener, /screener/stream and /screener/data.json; returns false for other paths. */
+      handle(req, res) {
+        const url = new URL(req.url ?? "/", "http://localhost");
+        const path = url.pathname.replace(/\/+$/, "") || "/";
+        if (path !== "/screener" && !path.startsWith("/screener/")) return false;
+        if (this.token && url.searchParams.get("token") !== this.token && req.headers.authorization !== `Bearer ${this.token}`) {
+          res.writeHead(401, { "content-type": "text/plain" }).end("unauthorized: open the screener link with ?token=<token>");
+          return true;
+        }
+        if (req.method !== "GET") {
+          res.writeHead(405, { "content-type": "text/plain" }).end("GET only");
+          return true;
+        }
+        const window = url.searchParams.get("window") ?? "1h";
+        const win = window in SCREENER_WINDOWS ? window : "1h";
+        if (path === "/screener") {
+          res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(SCREENER_PAGE);
+        } else if (path === "/screener/data.json") {
+          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }).end(JSON.stringify(screenerSnapshot(this.hub, win)));
+        } else if (path === "/screener/stream") {
+          this.attach(res, win);
+        } else {
+          res.writeHead(404, { "content-type": "text/plain" }).end("not found");
+        }
+        return true;
+      }
+      attach(res, window) {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-store",
+          connection: "keep-alive",
+          "x-accel-buffering": "no"
+        });
+        res.write("retry: 2000\n\n");
+        const client = { res, window, prices: /* @__PURE__ */ new Map() };
+        this.clients.add(client);
+        res.on("close", () => {
+          this.clients.delete(client);
+          if (!this.clients.size) this.stop();
+        });
+        this.sendFull([client]);
+        this.start();
+      }
+      start() {
+        if (this.tickTimer) return;
+        this.tickTimer = setInterval(() => this.sendTicks(), TICK_MS);
+        this.fullTimer = setInterval(() => this.sendFull([...this.clients]), FULL_MS);
+        this.tickTimer.unref?.();
+        this.fullTimer.unref?.();
+      }
+      stop() {
+        if (this.tickTimer) clearInterval(this.tickTimer);
+        if (this.fullTimer) clearInterval(this.fullTimer);
+        this.tickTimer = this.fullTimer = null;
+      }
+      sendFull(clients) {
+        const byWindow = /* @__PURE__ */ new Map();
+        for (const client of clients) {
+          let payload = byWindow.get(client.window);
+          if (!payload) {
+            const snap = screenerSnapshot(this.hub, client.window);
+            for (const row of snap.rows) client.prices.set(row.key, row.last);
+            payload = `event: full
+data: ${JSON.stringify(snap)}
+
+`;
+            byWindow.set(client.window, payload);
+          }
+          client.res.write(payload);
+        }
+      }
+      sendTicks() {
+        const prices = /* @__PURE__ */ new Map();
+        for (const m of this.hub.list()) prices.set(m.spec.key, sig(livePrice(m), 10));
+        for (const client of this.clients) {
+          const changed = {};
+          let any = false;
+          for (const [key2, price] of prices) {
+            if (price !== null && client.prices.get(key2) !== price) {
+              changed[key2] = price;
+              client.prices.set(key2, price);
+              any = true;
+            }
+          }
+          if (any) client.res.write(`event: tick
+data: ${JSON.stringify({ t: Date.now(), p: changed })}
+
+`);
+        }
+      }
+      close() {
+        this.stop();
+        for (const client of this.clients) client.res.end();
+        this.clients.clear();
+      }
+    };
+  }
+});
+
 // src/lib/adapters/capabilities.ts
 function venueSupports(venue, symbol, marketType) {
   return venuesWithData(symbol, marketType).includes(venue);
@@ -2271,532 +4360,6 @@ var init_marketAggregation = __esm({
   }
 });
 
-// src/lib/engine/orderFlowEngine.ts
-function getCandleOpenTime(timestamp, timeframe) {
-  const ms = TIMEFRAME_MS[timeframe];
-  return Math.floor(timestamp / ms) * ms;
-}
-function roundToTick(price, tickSize) {
-  if (!Number.isFinite(price) || tickSize <= 0) return price;
-  const index = Math.round(price / tickSize);
-  const decimals = getTickDecimals(tickSize);
-  return Number((index * tickSize).toFixed(decimals + 2));
-}
-function getTickDecimals(tickSize) {
-  if (!Number.isFinite(tickSize) || tickSize <= 0) return 0;
-  for (let decimals = 0; decimals <= 10; decimals++) {
-    const scaled = tickSize * 10 ** decimals;
-    if (Math.abs(scaled - Math.round(scaled)) < 1e-9 * Math.max(1, scaled)) return decimals;
-  }
-  return 10;
-}
-function createEmptyCandle(openTime, timeframe) {
-  const ms = TIMEFRAME_MS[timeframe];
-  return {
-    openTime,
-    closeTime: openTime + ms - 1,
-    open: 0,
-    high: -Infinity,
-    low: Infinity,
-    close: 0,
-    volume: 0,
-    delta: 0,
-    cumulativeDelta: 0,
-    levels: /* @__PURE__ */ new Map(),
-    sortedPrices: [],
-    tradeCount: 0,
-    maxVolumeAtLevel: 0,
-    complete: false,
-    venueVolumes: {}
-  };
-}
-function applyTradeToCandle(candle, trade, tickSize, imbalanceThreshold) {
-  const roundedPrice = roundToTick(trade.price, tickSize);
-  if (candle.open === 0) candle.open = trade.price;
-  candle.close = trade.price;
-  if (trade.price > candle.high) candle.high = trade.price;
-  if (trade.price < candle.low) candle.low = trade.price;
-  let level = candle.levels.get(roundedPrice);
-  if (!level) {
-    level = {
-      price: roundedPrice,
-      bidVolume: 0,
-      askVolume: 0,
-      totalVolume: 0,
-      delta: 0,
-      tradeCount: 0,
-      buyTrades: 0,
-      sellTrades: 0,
-      maxTradeSize: 0,
-      imbalance: "neutral",
-      isHighVolume: false,
-      zScore: 0
-    };
-    candle.levels.set(roundedPrice, level);
-    insertSorted(candle.sortedPrices, roundedPrice);
-  }
-  if (trade.side === "buy") {
-    level.askVolume += trade.quantity;
-    level.buyTrades += 1;
-  } else {
-    level.bidVolume += trade.quantity;
-    level.sellTrades += 1;
-  }
-  level.totalVolume += trade.quantity;
-  level.delta = level.askVolume - level.bidVolume;
-  level.tradeCount += 1;
-  if (trade.quantity > level.maxTradeSize) level.maxTradeSize = trade.quantity;
-  if (level.bidVolume > 0 && level.askVolume / level.bidVolume >= imbalanceThreshold) {
-    level.imbalance = "ask";
-  } else if (level.askVolume > 0 && level.bidVolume / level.askVolume >= imbalanceThreshold) {
-    level.imbalance = "bid";
-  } else {
-    level.imbalance = "neutral";
-  }
-  candle.volume += trade.quantity;
-  candle.venueVolumes[trade.venue] = (candle.venueVolumes[trade.venue] ?? 0) + trade.quantity;
-  candle.tradeCount += 1;
-  if (trade.side === "buy") {
-    candle.delta += trade.quantity;
-  } else {
-    candle.delta -= trade.quantity;
-  }
-  if (level.totalVolume > candle.maxVolumeAtLevel) {
-    candle.maxVolumeAtLevel = level.totalVolume;
-  }
-  return candle;
-}
-function applyZScores(candle, allLevels) {
-  if (allLevels.length < 2) return;
-  const volumes = allLevels.map((l) => l.totalVolume);
-  const mean = volumes.reduce((a, b) => a + b, 0) / volumes.length;
-  const variance = volumes.reduce((a, b) => a + (b - mean) ** 2, 0) / volumes.length;
-  const std = Math.sqrt(variance);
-  if (std === 0) return;
-  for (const level of candle.levels.values()) {
-    level.zScore = (level.totalVolume - mean) / std;
-    level.isHighVolume = level.zScore >= 2;
-  }
-}
-function computeVolumeProfile(candles, valueAreaPct = 0.7) {
-  const map = /* @__PURE__ */ new Map();
-  for (const candle of candles) {
-    for (const [price, level] of candle.levels) {
-      const existing = map.get(price) ?? { bid: 0, ask: 0, trades: 0 };
-      existing.bid += level.bidVolume;
-      existing.ask += level.askVolume;
-      existing.trades += level.tradeCount;
-      map.set(price, existing);
-    }
-  }
-  const prices = [...map.keys()].sort((a, b) => a - b);
-  const totalVol = prices.reduce((s, p) => s + (map.get(p)?.bid ?? 0) + (map.get(p)?.ask ?? 0), 0);
-  let pocPrice = prices[0] ?? 0;
-  let pocVol = 0;
-  for (const p of prices) {
-    const d = map.get(p);
-    const v = d.bid + d.ask;
-    if (v > pocVol) {
-      pocVol = v;
-      pocPrice = p;
-    }
-  }
-  const target = totalVol * valueAreaPct;
-  let vah = pocPrice;
-  let val = pocPrice;
-  let accumulated = pocVol;
-  let hi = prices.indexOf(pocPrice);
-  let lo = hi;
-  while (accumulated < target && (hi < prices.length - 1 || lo > 0)) {
-    const nextHiVol = hi < prices.length - 1 ? ((d) => d.bid + d.ask)(map.get(prices[hi + 1])) : 0;
-    const nextLoVol = lo > 0 ? ((d) => d.bid + d.ask)(map.get(prices[lo - 1])) : 0;
-    if (nextHiVol >= nextLoVol && hi < prices.length - 1) {
-      hi++;
-      vah = prices[hi];
-      accumulated += nextHiVol;
-    } else if (lo > 0) {
-      lo--;
-      val = prices[lo];
-      accumulated += nextLoVol;
-    } else {
-      break;
-    }
-  }
-  const levels = prices.map((price) => {
-    const d = map.get(price);
-    const tv = d.bid + d.ask;
-    return {
-      price,
-      totalVolume: tv,
-      bidVolume: d.bid,
-      askVolume: d.ask,
-      delta: d.ask - d.bid,
-      tradeCount: d.trades,
-      isPOC: price === pocPrice,
-      isVAH: price === vah,
-      isVAL: price === val
-    };
-  });
-  const buyVolume = levels.reduce((s, l) => s + l.askVolume, 0);
-  const sellVolume = levels.reduce((s, l) => s + l.bidVolume, 0);
-  return {
-    levels,
-    poc: pocPrice,
-    vah,
-    val,
-    totalVolume: totalVol,
-    buyVolume,
-    sellVolume,
-    delta: buyVolume - sellVolume
-  };
-}
-function computeOBI(bidVolume, askVolume) {
-  const total = bidVolume + askVolume;
-  if (total === 0) return 0;
-  return (bidVolume - askVolume) / total;
-}
-function insertSorted(arr, val) {
-  let lo = 0;
-  let hi = arr.length;
-  while (lo < hi) {
-    const mid = lo + hi >>> 1;
-    if (arr[mid] < val) lo = mid + 1;
-    else hi = mid;
-  }
-  if (arr[lo] !== val) arr.splice(lo, 0, val);
-}
-var TIMEFRAME_MS;
-var init_orderFlowEngine = __esm({
-  "src/lib/engine/orderFlowEngine.ts"() {
-    "use strict";
-    TIMEFRAME_MS = {
-      "1m": 6e4,
-      "5m": 3e5,
-      "15m": 9e5,
-      "30m": 18e5,
-      "1h": 36e5,
-      "4h": 144e5
-    };
-  }
-});
-
-// src/lib/engine/analytics.ts
-function secondsPerYear(_marketType) {
-  return SECONDS_PER_YEAR.crypto;
-}
-function createFlowBar(time, price, cvd) {
-  return {
-    time,
-    open: price,
-    high: price,
-    low: price,
-    close: price,
-    volume: 0,
-    buyVolume: 0,
-    sellVolume: 0,
-    trades: 0,
-    cvd
-  };
-}
-function resampleBars(bars, seconds) {
-  if (seconds <= 1) return bars;
-  const bucketMs = seconds * 1e3;
-  const out = [];
-  let current = null;
-  for (const bar of bars) {
-    const bucket = Math.floor(bar.time / bucketMs) * bucketMs;
-    if (!current || current.time !== bucket) {
-      if (current) out.push(current);
-      current = { ...bar, time: bucket };
-      continue;
-    }
-    current.high = Math.max(current.high, bar.high);
-    current.low = Math.min(current.low, bar.low);
-    current.close = bar.close;
-    current.volume += bar.volume;
-    current.buyVolume += bar.buyVolume;
-    current.sellVolume += bar.sellVolume;
-    current.trades += bar.trades;
-    current.cvd = bar.cvd;
-  }
-  if (current) out.push(current);
-  return out;
-}
-function rollingVolumeZScores(bars, window, minSamples = Math.min(window, 10)) {
-  const out = new Array(bars.length);
-  let sum = 0;
-  let sumSq = 0;
-  for (let i = 0; i < bars.length; i++) {
-    const n = Math.min(i, window);
-    let mean = null;
-    let std = null;
-    let z2 = null;
-    if (n >= Math.max(2, minSamples)) {
-      mean = sum / n;
-      const variance = Math.max(0, (sumSq - n * mean * mean) / (n - 1));
-      std = Math.sqrt(variance);
-      z2 = std > 0 ? (bars[i].volume - mean) / std : 0;
-    }
-    out[i] = {
-      time: bars[i].time,
-      z: z2,
-      volume: bars[i].volume,
-      buyVolume: bars[i].buyVolume,
-      sellVolume: bars[i].sellVolume,
-      mean,
-      std
-    };
-    sum += bars[i].volume;
-    sumSq += bars[i].volume ** 2;
-    if (i - window >= 0) {
-      sum -= bars[i - window].volume;
-      sumSq -= bars[i - window].volume ** 2;
-    }
-  }
-  return out;
-}
-function rollingRealizedVolatility(bars, window, barSeconds, yearSeconds, minSamples = Math.min(window, 10)) {
-  const annualize = Math.sqrt(yearSeconds / barSeconds);
-  const returns2 = new Array(bars.length).fill(0);
-  for (let i = 1; i < bars.length; i++) {
-    const prev = bars[i - 1].close;
-    const curr = bars[i].close;
-    returns2[i] = prev > 0 && curr > 0 ? Math.log(curr / prev) : 0;
-  }
-  const out = new Array(bars.length);
-  let sumSq = 0;
-  for (let i = 0; i < bars.length; i++) {
-    if (i >= 1) sumSq += returns2[i] ** 2;
-    if (i - window >= 1) sumSq -= returns2[i - window] ** 2;
-    const n = Math.min(i, window);
-    out[i] = {
-      time: bars[i].time,
-      value: n >= Math.max(2, minSamples) ? Math.sqrt(Math.max(0, sumSq) / n) * annualize * 100 : null
-    };
-  }
-  return out;
-}
-function createSessionStats(startTime, price) {
-  return {
-    startTime,
-    open: price,
-    high: price,
-    low: price,
-    last: price,
-    volume: 0,
-    notional: 0,
-    buyVolume: 0,
-    sellVolume: 0,
-    trades: 0,
-    maxTrade: 0,
-    vwap: price,
-    vwapStd: 0,
-    sumPQ: 0,
-    sumP2Q: 0,
-    lastTradeLagMs: 0
-  };
-}
-function applyTradeToSession(stats, price, quantity, side, lagMs) {
-  stats.last = price;
-  if (price > stats.high) stats.high = price;
-  if (price < stats.low) stats.low = price;
-  stats.volume += quantity;
-  stats.notional += price * quantity;
-  if (side === "buy") stats.buyVolume += quantity;
-  else stats.sellVolume += quantity;
-  stats.trades += 1;
-  if (quantity > stats.maxTrade) stats.maxTrade = quantity;
-  stats.sumPQ += price * quantity;
-  stats.sumP2Q += price * price * quantity;
-  if (stats.volume > 0) {
-    stats.vwap = stats.sumPQ / stats.volume;
-    const variance = stats.sumP2Q / stats.volume - stats.vwap * stats.vwap;
-    stats.vwapStd = Math.sqrt(Math.max(0, variance));
-  }
-  stats.lastTradeLagMs = lagMs;
-}
-function resolveTickSize(price, _marketType) {
-  if (!Number.isFinite(price) || price <= 0) return 1;
-  const raw = price * 1e-4;
-  const exponent = Math.floor(Math.log10(raw));
-  const magnitude = 10 ** exponent;
-  const normalized = raw / magnitude;
-  const nice = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 2.5 ? 2.5 : normalized <= 5 ? 5 : 10;
-  return Number((nice * magnitude).toPrecision(6));
-}
-var SECONDS_PER_YEAR;
-var init_analytics = __esm({
-  "src/lib/engine/analytics.ts"() {
-    "use strict";
-    SECONDS_PER_YEAR = {
-      // Crypto trades 24/7.
-      crypto: 365 * 86400
-    };
-  }
-});
-
-// src/lib/engine/derivatives.ts
-function mergeDerivatives(previous, update) {
-  const merged = { ...previous ?? { venue: update.venue }, timestamp: update.timestamp };
-  for (const [key2, value] of Object.entries(update)) {
-    if (value !== void 0) merged[key2] = value;
-  }
-  return merged;
-}
-function fundingRate8h(snapshot) {
-  if (snapshot.fundingRate === void 0) return void 0;
-  const hours = snapshot.fundingIntervalHours ?? DEFAULT_FUNDING_HOURS;
-  return snapshot.fundingRate * (8 / hours);
-}
-function annualizeFunding(rate, intervalHours = DEFAULT_FUNDING_HOURS) {
-  return rate * (24 / intervalHours) * 365;
-}
-function aggregateDerivatives(snapshots, primaryVenue, referencePrice, oiVenues) {
-  if (!snapshots.length) return null;
-  const primary = snapshots.find((s) => s.venue === primaryVenue) ?? snapshots[0];
-  let oi = 0;
-  let oiValue = 0;
-  let oiCount = 0;
-  for (const s of snapshots) {
-    if (s.openInterest === void 0) continue;
-    if (oiVenues && !oiVenues.has(s.venue)) continue;
-    oi += s.openInterest;
-    oiValue += s.openInterest * (s.markPrice ?? referencePrice ?? 0);
-    oiCount++;
-  }
-  const weighted = (value) => {
-    let sum = 0;
-    let weight = 0;
-    for (const s of snapshots) {
-      const v = value(s);
-      if (v === void 0 || !Number.isFinite(v)) continue;
-      const w = s.openInterest && s.openInterest > 0 ? s.openInterest : 1;
-      sum += v * w;
-      weight += w;
-    }
-    return weight > 0 ? sum / weight : null;
-  };
-  return {
-    timestamp: Math.max(...snapshots.map((s) => s.timestamp)),
-    venues: snapshots,
-    openInterest: oiCount ? oi : null,
-    openInterestValue: oiCount && oiValue > 0 ? oiValue : null,
-    fundingRate8h: weighted(fundingRate8h),
-    nextFundingTime: primary.nextFundingTime ?? null,
-    fundingIntervalHours: primary.fundingRate !== void 0 ? primary.fundingIntervalHours ?? DEFAULT_FUNDING_HOURS : null,
-    primaryFundingRate: primary.fundingRate ?? null,
-    markPrice: weighted((s) => s.markPrice),
-    indexPrice: weighted((s) => s.indexPrice),
-    basisBps: weighted((s) => s.markPrice && s.indexPrice ? (s.markPrice - s.indexPrice) / s.indexPrice * 1e4 : void 0)
-  };
-}
-function classifyOIRegime(priceChange, oiChange, priceThreshold = 5e-4, oiThreshold = 1e-3) {
-  if (Math.abs(priceChange) < priceThreshold || Math.abs(oiChange) < oiThreshold) return "neutral";
-  if (priceChange > 0) return oiChange > 0 ? "new-longs" : "short-covering";
-  return oiChange > 0 ? "new-shorts" : "long-unwind";
-}
-function oiWindowChange(history, windowMs) {
-  if (history.length < 2) return null;
-  const to = history[history.length - 1];
-  const cutoff = to.time - windowMs;
-  let lo = 0;
-  let hi = history.length - 1;
-  while (lo < hi) {
-    const mid = lo + hi >> 1;
-    if (history[mid].time < cutoff) lo = mid + 1;
-    else hi = mid;
-  }
-  const from = history[lo];
-  if (from === to || !(from.openInterest > 0) || !(from.price > 0)) return null;
-  const priceChange = (to.price - from.price) / from.price;
-  const oiChange = (to.openInterest - from.openInterest) / from.openInterest;
-  return {
-    priceChange,
-    oiChange,
-    oiDelta: to.openInterest - from.openInterest,
-    regime: classifyOIRegime(priceChange, oiChange),
-    from,
-    to
-  };
-}
-function bucketLiquidations(liquidations, bucketMs, count, now2) {
-  const end = Math.floor(now2 / bucketMs) * bucketMs;
-  const start = end - (count - 1) * bucketMs;
-  const buckets = Array.from({ length: count }, (_, i) => ({
-    time: start + i * bucketMs,
-    longNotional: 0,
-    shortNotional: 0,
-    longQty: 0,
-    shortQty: 0,
-    count: 0
-  }));
-  for (const l of liquidations) {
-    const index = Math.floor((l.timestamp - start) / bucketMs);
-    if (index < 0 || index >= count) continue;
-    const b = buckets[index];
-    if (l.side === "long") {
-      b.longNotional += l.quoteVolume;
-      b.longQty += l.quantity;
-    } else {
-      b.shortNotional += l.quoteVolume;
-      b.shortQty += l.quantity;
-    }
-    b.count++;
-  }
-  return buckets;
-}
-function summarizeLiquidations(liquidations, since) {
-  const summary = { longNotional: 0, shortNotional: 0, count: 0, largest: null };
-  for (let i = liquidations.length - 1; i >= 0; i--) {
-    const l = liquidations[i];
-    if (l.timestamp < since - ARRIVAL_SLACK_MS) break;
-    if (l.timestamp < since) continue;
-    if (l.side === "long") summary.longNotional += l.quoteVolume;
-    else summary.shortNotional += l.quoteVolume;
-    summary.count++;
-    if (!summary.largest || l.quoteVolume > summary.largest.quoteVolume) summary.largest = l;
-  }
-  return summary;
-}
-function isLiquidationCascade(buckets, multiple = 5, floor = 0) {
-  if (buckets.length < 4) return false;
-  const last = buckets[buckets.length - 1];
-  const total = last.longNotional + last.shortNotional;
-  if (total <= floor) return false;
-  const history = buckets.slice(0, -1).map((b) => b.longNotional + b.shortNotional).filter((v) => v > 0).sort((a, b) => a - b);
-  if (history.length < 3) return false;
-  const median = history[Math.floor(history.length / 2)];
-  return total >= median * multiple;
-}
-var DEFAULT_FUNDING_HOURS, LIQUIDATION_FEED_VENUES, OI_REGIME_LABEL, OI_REGIME_HINT, ARRIVAL_SLACK_MS;
-var init_derivatives = __esm({
-  "src/lib/engine/derivatives.ts"() {
-    "use strict";
-    DEFAULT_FUNDING_HOURS = 8;
-    LIQUIDATION_FEED_VENUES = /* @__PURE__ */ new Set([
-      "binance-futures",
-      "bybit-futures",
-      "okx-futures",
-      "deribit"
-    ]);
-    OI_REGIME_LABEL = {
-      "new-longs": "New longs",
-      "short-covering": "Short covering",
-      "new-shorts": "New shorts",
-      "long-unwind": "Long unwind",
-      neutral: "Balanced"
-    };
-    OI_REGIME_HINT = {
-      "new-longs": "Price up with rising open interest: fresh long positioning is driving the move.",
-      "short-covering": "Price up with falling open interest: shorts are closing; the rally is driven by exits, not new demand.",
-      "new-shorts": "Price down with rising open interest: fresh short positioning is driving the move.",
-      "long-unwind": "Price down with falling open interest: longs are closing or being liquidated.",
-      neutral: "Price or open interest is roughly flat over the window."
-    };
-    ARRIVAL_SLACK_MS = 6e4;
-  }
-});
-
 // src/lib/session/RingBuffer.ts
 var RingBuffer;
 var init_RingBuffer = __esm({
@@ -2882,7 +4445,7 @@ var init_depthHistory = __esm({
        * Sum the venues' levels into tick buckets within ±DEPTH_BAND of `mid`
        * and append a snapshot. Returns the snapshot (for recording) or null.
        */
-      add(time, sides, tick, mid) {
+      add(time2, sides, tick, mid) {
         if (!(tick > 0) || !(mid > 0)) return null;
         const lo = mid * (1 - DEPTH_BAND);
         const hi = mid * (1 + DEPTH_BAND);
@@ -2904,16 +4467,16 @@ var init_depthHistory = __esm({
           index[k] = i;
           size[k] = s;
         });
-        return this.addSnapshot(time, index, size, tick);
+        return this.addSnapshot(time2, index, size, tick);
       }
       /** Append prebuilt bucket arrays (used when replaying a recording). */
-      addSnapshot(time, index, size, tick) {
+      addSnapshot(time2, index, size, tick) {
         if (!(tick > 0) || !index.length) return null;
         if (tick !== this._tick) {
           this.clear();
           this._tick = tick;
         }
-        const bucketTime = Math.floor(time / DEPTH_INTERVAL_MS) * DEPTH_INTERVAL_MS;
+        const bucketTime = Math.floor(time2 / DEPTH_INTERVAL_MS) * DEPTH_INTERVAL_MS;
         const last = this.get(this.lastSeq);
         let snapshot;
         if (last && last.time === bucketTime) {
@@ -2930,12 +4493,12 @@ var init_depthHistory = __esm({
         return this.ring[seq % this.capacity];
       }
       /** First sequence number whose snapshot time is ≥ `time` (lastSeq + 1 if none). */
-      seqAtOrAfter(time) {
+      seqAtOrAfter(time2) {
         let lo = this.firstSeq;
         let hi = this.nextSeq;
         while (lo < hi) {
           const mid = lo + hi >> 1;
-          if (this.get(mid).time < time) lo = mid + 1;
+          if (this.get(mid).time < time2) lo = mid + 1;
           else hi = mid;
         }
         return lo;
@@ -3088,135 +4651,6 @@ var init_microstructure = __esm({
             ratio: c.traded / c.displayed
           });
         }
-        return out;
-      }
-    };
-  }
-});
-
-// src/lib/engine/venues.ts
-function grid(list, from, count) {
-  const out = new Float64Array(count);
-  let j = 0;
-  let last = NaN;
-  for (let i = 0; i < count; i++) {
-    const t = from + i * VENUE_BUCKET_MS;
-    while (j < list.length && list[j].time <= t) last = list[j++].close;
-    out[i] = last;
-  }
-  return Number.isFinite(out[0]) ? out : null;
-}
-function returns(prices) {
-  const r = new Float64Array(prices.length - 1);
-  for (let i = 1; i < prices.length; i++) r[i - 1] = Math.log(prices[i] / prices[i - 1]);
-  return r;
-}
-function laggedCorrelation(a, b, lag) {
-  let sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, n = 0;
-  for (let t = Math.max(0, -lag); t < a.length && t + lag < b.length; t++) {
-    const x = a[t];
-    const y = b[t + lag];
-    sa += x;
-    sb += y;
-    saa += x * x;
-    sbb += y * y;
-    sab += x * y;
-    n++;
-  }
-  if (n < 10) return 0;
-  const cov = sab / n - sa / n * (sb / n);
-  const va = saa / n - (sa / n) ** 2;
-  const vb = sbb / n - (sb / n) ** 2;
-  return va > 0 && vb > 0 ? cov / Math.sqrt(va * vb) : 0;
-}
-function venueSummary(series, now2, windowMs = 6e4, leadWindowMs = 15e4, maxLag = 8, minCorr = 0.1) {
-  const venues = Object.keys(series).filter((v) => series[v]?.length);
-  const lasts = venues.map((v) => series[v][series[v].length - 1].close).sort((a, b) => a - b);
-  const median = lasts.length ? lasts[Math.floor(lasts.length / 2)] : 0;
-  const since = now2 - windowMs;
-  let totalVolume = 0;
-  const stats = venues.map((venue) => {
-    const list = series[venue];
-    let volume = 0;
-    let delta = 0;
-    for (let i = list.length - 1; i >= 0 && list[i].time >= since; i--) {
-      volume += list[i].buy + list[i].sell;
-      delta += list[i].buy - list[i].sell;
-    }
-    totalVolume += volume;
-    const last = list[list.length - 1].close;
-    return { venue, last, premiumBps: median ? (last - median) / median * 1e4 : 0, volume, share: 0, delta, leadMs: null, leadCorr: null };
-  });
-  for (const s of stats) s.share = totalVolume ? s.volume / totalVolume : 0;
-  const sharedStart = Math.max(now2 - leadWindowMs, ...venues.map((v) => series[v][0].time));
-  const from = Math.ceil(sharedStart / VENUE_BUCKET_MS) * VENUE_BUCKET_MS;
-  const count = Math.floor((now2 - from) / VENUE_BUCKET_MS);
-  if (venues.length >= 2 && count >= MIN_LEAD_BUCKETS) {
-    const r = /* @__PURE__ */ new Map();
-    for (const venue of venues) {
-      const prices = grid(series[venue], from, count);
-      if (prices) r.set(venue, returns(prices));
-    }
-    for (const stat of stats) {
-      const own = r.get(stat.venue);
-      const others = [...r.entries()].filter(([v]) => v !== stat.venue).map(([, x]) => x);
-      if (!own || !others.length) continue;
-      const ref = new Float64Array(own.length);
-      for (const o of others) for (let i = 0; i < ref.length; i++) ref[i] += o[i] / others.length;
-      let bestLag = 0;
-      let best = laggedCorrelation(own, ref, 0);
-      for (let lag = -maxLag; lag <= maxLag; lag++) {
-        if (lag === 0) continue;
-        const c = laggedCorrelation(own, ref, lag);
-        if (c > best) {
-          best = c;
-          bestLag = lag;
-        }
-      }
-      if (best < minCorr) continue;
-      stat.leadMs = bestLag * VENUE_BUCKET_MS;
-      stat.leadCorr = best;
-    }
-  }
-  stats.sort((a, b) => b.volume - a.volume);
-  const leaders = stats.filter((s) => s.leadMs !== null && s.leadMs > 0).sort((a, b) => b.leadMs - a.leadMs || b.leadCorr - a.leadCorr);
-  return { stats, leader: leaders[0] ?? null };
-}
-var VENUE_BUCKET_MS, VENUE_BUCKETS, MIN_LEAD_BUCKETS, VenueTracker;
-var init_venues = __esm({
-  "src/lib/engine/venues.ts"() {
-    "use strict";
-    VENUE_BUCKET_MS = 250;
-    VENUE_BUCKETS = 720;
-    MIN_LEAD_BUCKETS = 120;
-    VenueTracker = class {
-      series = /* @__PURE__ */ new Map();
-      clear() {
-        this.series.clear();
-      }
-      onTrade(trade) {
-        const time = Math.floor(trade.timestamp / VENUE_BUCKET_MS) * VENUE_BUCKET_MS;
-        let list = this.series.get(trade.venue);
-        if (!list) {
-          list = [];
-          this.series.set(trade.venue, list);
-        }
-        let bucket = list[list.length - 1];
-        if (!bucket || time > bucket.time) {
-          bucket = { time, close: trade.price, buy: 0, sell: 0, trades: 0 };
-          list.push(bucket);
-          if (list.length > VENUE_BUCKETS) list.splice(0, list.length - VENUE_BUCKETS);
-        } else if (time < bucket.time) {
-        } else {
-          bucket.close = trade.price;
-        }
-        if (trade.side === "buy") bucket.buy += trade.quantity;
-        else bucket.sell += trade.quantity;
-        bucket.trades++;
-      }
-      snapshot() {
-        const out = {};
-        for (const [venue, list] of this.series) out[venue] = list.map((b) => ({ ...b }));
         return out;
       }
     };
@@ -3453,10 +4887,10 @@ var init_marketDataManager = __esm({
         else this.onDerivatives(payload);
       }
       /** Move the virtual clock forward, running the once-a-second work for each second crossed. */
-      advanceClock(time) {
-        if (!this.replaying || time <= this.replayClock) return;
-        this.replayClock = time;
-        const target = Math.floor(time / OI_SAMPLE_MS) * OI_SAMPLE_MS;
+      advanceClock(time2) {
+        if (!this.replaying || time2 <= this.replayClock) return;
+        this.replayClock = time2;
+        const target = Math.floor(time2 / OI_SAMPLE_MS) * OI_SAMPLE_MS;
         let next = Math.max(this.lastSecondSample + OI_SAMPLE_MS, target - 120 * OI_SAMPLE_MS);
         for (; next <= target; next += OI_SAMPLE_MS) this.sampleSecond(next);
         this.lastSecondSample = target;
@@ -4232,780 +5666,308 @@ var init_market = __esm({
   }
 });
 
-// src/lib/engine/imbalance.ts
-function imbalanceOf(level, ratio) {
-  if (level.bidVolume > 0 && level.askVolume / level.bidVolume >= ratio) return "buy";
-  if (level.askVolume > 0 && level.bidVolume / level.askVolume >= ratio) return "sell";
-  return null;
-}
-function stackedRuns(candle, ratio, minLevels) {
-  const out = [];
-  const prices = candle.sortedPrices;
-  let dir = null;
-  let startIndex = 0;
-  const flush = (endIndex) => {
-    if (dir && endIndex - startIndex + 1 >= minLevels) out.push({ dir, start: prices[startIndex], end: prices[endIndex] });
-  };
-  for (let i = 0; i < prices.length; i++) {
-    const level = candle.levels.get(prices[i]);
-    const d = level ? imbalanceOf(level, ratio) : null;
-    if (d !== dir) {
-      flush(i - 1);
-      dir = d;
-      startIndex = i;
-    }
-  }
-  flush(prices.length - 1);
-  return out;
-}
-var init_imbalance = __esm({
-  "src/lib/engine/imbalance.ts"() {
-    "use strict";
-  }
+// src/tui.ts
+var tui_exports = {};
+__export(tui_exports, {
+  DEFAULT_TUI_SYMBOLS: () => DEFAULT_TUI_SYMBOLS,
+  SORTS: () => SORTS,
+  fmtPrice: () => fmtPrice,
+  fmtUsd: () => fmtUsd,
+  parseTuiArgs: () => parseTuiArgs,
+  renderFrame: () => renderFrame,
+  runTui: () => runTui,
+  spark: () => spark
 });
-
-// src/views.ts
-function sig(x, digits = 5) {
-  if (x === null || x === void 0 || !Number.isFinite(x)) return null;
-  if (x === 0) return 0;
-  return Number(x.toPrecision(digits));
+function cell(text, width, color = WHITE, align = "l", back = BG, bold = false) {
+  const t = text.length > width ? text.slice(0, Math.max(0, width - 1)) + "\u2026" : text;
+  const padded = align === "r" ? t.padStart(width) : t.padEnd(width);
+  return `${bg(back)}${fg(color)}${bold ? BOLD : ""}${padded}${bold ? NOBOLD : ""}${bg(BG)}`;
 }
-function fixed(x, decimals) {
-  if (x === null || x === void 0 || !Number.isFinite(x)) return null;
-  return Number(x.toFixed(decimals));
+function fmtPrice(x, decimals) {
+  if (x === null) return "\u2014";
+  return x.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
-function iso(ms) {
-  if (!ms || !Number.isFinite(ms)) return null;
-  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+function fmtUsd(x) {
+  const a = Math.abs(x), s = x < 0 ? "-" : "";
+  if (a >= 1e9) return `${s}$${(a / 1e9).toFixed(2)}B`;
+  if (a >= 1e6) return `${s}$${(a / 1e6).toFixed(1)}M`;
+  if (a >= 1e3) return `${s}$${(a / 1e3).toFixed(0)}K`;
+  return `${s}$${a.toFixed(0)}`;
 }
-function usd(x) {
-  if (x === null || x === void 0 || !Number.isFinite(x)) return null;
-  const a = Math.abs(x), sign = x < 0 ? "-" : "";
-  if (a >= 1e9) return `${sign}$${(a / 1e9).toFixed(2)}B`;
-  if (a >= 1e6) return `${sign}$${(a / 1e6).toFixed(2)}M`;
-  if (a >= 1e3) return `${sign}$${(a / 1e3).toFixed(1)}K`;
-  return `${sign}$${a.toFixed(0)}`;
+function fmtNum(x) {
+  const a = Math.abs(x), s = x > 0 ? "+" : "";
+  if (a >= 1e6) return `${s}${(x / 1e6).toFixed(1)}M`;
+  if (a >= 1e3) return `${s}${(x / 1e3).toFixed(1)}K`;
+  if (a >= 100) return `${s}${x.toFixed(0)}`;
+  return `${s}${x.toFixed(a >= 1 ? 1 : 3)}`;
 }
-function pricer(market) {
-  const tick = market.manager.tickSize || 1;
-  const decimals = Math.min(10, getTickDecimals(tick) + 1);
-  return (p) => fixed(p, decimals);
+function spark(values, width, baseline) {
+  if (width <= 0) return "";
+  const out = [];
+  for (let i = 0; i < width; i++) {
+    const from = Math.floor(i * values.length / width);
+    const to = Math.max(from + 1, Math.floor((i + 1) * values.length / width));
+    let v = null;
+    for (let j = from; j < to && j < values.length; j++) if (values[j] !== null) v = values[j];
+    out.push(v);
+  }
+  const nums = out.filter((v) => v !== null);
+  if (!nums.length) return " ".repeat(width);
+  let lo = Math.min(...nums), hi = Math.max(...nums);
+  if (baseline !== null) {
+    lo = Math.min(lo, baseline);
+    hi = Math.max(hi, baseline);
+  }
+  const span = hi - lo || 1;
+  return out.map((v) => v === null ? " " : BLOCKS[Math.min(7, Math.floor((v - lo) / span * 7.999))]).join("");
 }
-function header(market) {
-  const s = market.state;
-  const age = Math.round(market.ageMs / 1e3);
-  return {
-    market: {
-      symbol: market.spec.symbol,
-      market_type: market.spec.marketType,
-      venue_selection: market.spec.selection,
-      venues: market.spec.venues
-    },
-    as_of: iso(s.marketClock || Date.now()),
-    streaming_since: iso(market.startedAt),
-    stream_age_s: age,
-    warming_up: !market.ready || age < 60,
-    tick_size: market.manager.tickSize
+function fitColumns(width) {
+  let cols = [...COLUMNS];
+  const total = (cs) => cs.reduce((a, c) => a + c.width + 1, 1);
+  while (total(cols) > width && cols.length > 4) {
+    const worst = Math.max(...cols.map((c) => c.priority));
+    const idx = cols.map((c) => c.priority).lastIndexOf(worst);
+    cols.splice(idx, 1);
+  }
+  const spare = Math.max(0, width - total(cols));
+  return cols.map((c) => ({ col: c, width: c.title === "TREND" ? Math.min(c.width + spare, 60) : c.width }));
+}
+function sortRows(rows, sort) {
+  const by = (f) => [...rows].sort((a, b) => Math.abs(f(b) ?? -Infinity) - Math.abs(f(a) ?? -Infinity));
+  if (sort === "change") return by((r) => r.change_pct);
+  if (sort === "volume") return by((r) => r.notional_5m_usd);
+  if (sort === "delta") return by((r) => r.delta_5m !== null && r.last ? r.delta_5m * r.last : null);
+  if (sort === "liquidations") return by((r) => r.liq_long_5m_usd + r.liq_short_5m_usd);
+  return rows;
+}
+function renderFrame(snap, view, width, height, now2 = Date.now()) {
+  const lines = [];
+  const line = (content = "") => lines.push(`${bg(BG)}${content}${bg(BG)}${ESC}K${RESET}`);
+  const left = ` ORDER FLOW <GO>  ${snap.rows.length} MKTS  ${view.source}`;
+  const right = `${view.window.toUpperCase()} WINDOW  ${time(now2)} UTC `;
+  line(cell(left + " ".repeat(Math.max(1, width - left.length - right.length)) + right, width, 16, "l", AMBER, true));
+  const cascades = snap.rows.filter((r) => r.cascade);
+  if (cascades.length) {
+    const text = " \u25B2 LIQUIDATION CASCADE  " + cascades.map((r) => `${r.base} L ${fmtUsd(r.liq_long_5m_usd)} / S ${fmtUsd(r.liq_short_5m_usd)} (5m)`).join("   ");
+    line(cell(text, width, WHITE, "l", Math.floor(now2 / 500) % 2 ? 160 : 88, true));
+  }
+  const cols = fitColumns(width);
+  line(" " + cols.map(({ col, width: w }) => cell(col.title, w, AMBER, col.align)).join(" "));
+  line(cell("\u2500".repeat(width), width, DIM));
+  const tableRoom = Math.max(1, height - lines.length - 6);
+  const rows = sortRows(snap.rows, view.sort).slice(0, tableRoom);
+  if (!snap.rows.length) line(cell("  No markets streaming yet.", width, GREY));
+  for (const r of rows) line(" " + cols.map(({ col, width: w }) => col.draw(r, w, view, now2)).join(" "));
+  if (snap.rows.length > rows.length) line(cell(`  \u2026 ${snap.rows.length - rows.length} more (enlarge the terminal)`, width, DIM));
+  line();
+  line(cell(" TAPE  blocks \xB7 absorption \xB7 icebergs \xB7 liquidations", width, AMBER, "l", BG, true));
+  line(cell("\u2500".repeat(width), width, DIM));
+  const tapeRoom = Math.max(0, height - lines.length - 1);
+  for (const e of snap.events.slice(0, tapeRoom)) {
+    const fresh = now2 - e.time < 3e3;
+    const side = e.side === "buy" ? UP : DOWN;
+    line(
+      " " + cell(time(e.time), 9, fresh ? WHITE : GREY) + cell(e.base, 6, AMBER, "l", BG, true) + cell(KIND[e.kind] ?? e.kind.toUpperCase(), 7, CYAN) + cell(e.side === "buy" ? "BUY" : "SELL", 5, side, "l", BG, true) + cell(fmtUsd(e.usd), 9, side, "r", BG, fresh) + "  " + cell(e.text, Math.max(0, width - 40), fresh ? WHITE : GREY)
+    );
+  }
+  while (lines.length < height - 1) line();
+  const keys = " 1 15M  2 1H  3 4H  4 SESSION   S SORT:" + view.sort.toUpperCase() + "   Q QUIT";
+  const status = view.status ? `${view.status} ` : "";
+  line(cell(keys + " ".repeat(Math.max(1, width - keys.length - status.length)) + status, width, GREY, "l", 235));
+  return lines.slice(0, height).join("\n");
+}
+async function runTui(options2) {
+  const out = process.stdout;
+  const view = { window: options2.window, sort: "watchlist", flashes: /* @__PURE__ */ new Map(), source: "", status: "" };
+  const lastPrice = /* @__PURE__ */ new Map();
+  let lastLog = "";
+  const capture = (...args) => {
+    lastLog = args.map(String).join(" ").replace(/\s+/g, " ").slice(0, 120);
   };
-}
-function connectionsView(market) {
-  const seen = market.manager.lastDataAt;
-  return market.connections().map((c) => {
-    const at = seen.get(c.venue);
-    return {
-      venue: c.venue,
-      status: c.status,
-      ...c.error && c.status !== "live" ? { error: c.error } : {},
-      last_data_s_ago: at ? fixed((Date.now() - at) / 1e3, 1) : null
+  console.log = console.info = console.warn = console.error = capture;
+  process.on("uncaughtException", (e) => capture(e instanceof Error ? e.message : e));
+  process.on("unhandledRejection", (e) => capture(e instanceof Error ? e.message : e));
+  let hub2 = null;
+  let fetchSnapshot;
+  if (options2.connect) {
+    const base = options2.connect.replace(/\/+$/, "").replace(/\/screener$/, "");
+    const url = new URL(base + "/screener/data.json");
+    const token = url.searchParams.get("token") ?? new URL(options2.connect).searchParams.get("token");
+    view.source = `\xB7 ${url.host}`;
+    fetchSnapshot = async () => {
+      url.search = `?window=${view.window}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(3e3) });
+      if (!res.ok) throw new Error(`${url.host} answered ${res.status}`);
+      return await res.json();
     };
-  });
-}
-function referenceLast(market, tape = market.manager.getTapeLog()) {
-  if (!tape.length) return null;
-  const wanted = market.spec.venues.length;
-  const cutoff = tape[0].timestamp - 6e4;
-  const latest = /* @__PURE__ */ new Map();
-  for (const t of tape) {
-    if (t.timestamp < cutoff || latest.size >= wanted) break;
-    if (!latest.has(t.venue)) latest.set(t.venue, t.price);
-  }
-  const prices = [...latest.values()].sort((a, b) => a - b);
-  const m = prices.length >> 1;
-  const price = prices.length % 2 ? prices[m] : (prices[m - 1] + prices[m]) / 2;
-  return { price, print: tape[0].price, printVenue: tape[0].venue, venues: prices.length };
-}
-function sigmaFromVwapOf(market) {
-  const session = market.state.session;
-  const ref = referenceLast(market);
-  if (!session || !ref || !(session.vwapStd > 0)) return null;
-  return (ref.price - session.vwap) / session.vwapStd;
-}
-function referenceQuote(market) {
-  const books = [...market.manager.getBooks().values()].filter((b) => b.bids[0] && b.asks[0]);
-  if (!books.length) return null;
-  const median = (xs) => {
-    const s = [...xs].sort((a, b) => a - b);
-    const m = s.length >> 1;
-    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-  };
-  const mids = books.map((b) => (b.bids[0].price + b.asks[0].price) / 2);
-  const spreads = books.map((b) => (b.asks[0].price - b.bids[0].price) / ((b.asks[0].price + b.bids[0].price) / 2) * 1e4);
-  const agg = market.state.aggregatedBook;
-  const crossed = !!agg && agg.bids[0] && agg.asks[0] ? agg.bids[0].price >= agg.asks[0].price : false;
-  return {
-    mid: median(mids),
-    spread_bps: median(spreads),
-    best_bid: Math.max(...books.map((b) => b.bids[0].price)),
-    best_ask: Math.min(...books.map((b) => b.asks[0].price)),
-    crossed,
-    venues: books.length
-  };
-}
-function allBars(market) {
-  const s = market.state;
-  return s.liveBar ? [...s.flowBars, s.liveBar] : [...s.flowBars];
-}
-function now(market) {
-  return market.state.marketClock || Date.now();
-}
-function flowWindow(market, windowMs) {
-  const bars = allBars(market);
-  const since = now(market) - windowMs;
-  let volume = 0, buy = 0, sell = 0, trades = 0, notional = 0;
-  let first = null, last = null;
-  let high = -Infinity, low = Infinity;
-  for (let i = bars.length - 1; i >= 0 && bars[i].time >= since; i--) {
-    const b = bars[i];
-    if (!last) last = b;
-    first = b;
-    volume += b.volume;
-    buy += b.buyVolume;
-    sell += b.sellVolume;
-    trades += b.trades;
-    notional += b.volume * b.close;
-    if (b.trades) {
-      high = Math.max(high, b.high);
-      low = Math.min(low, b.low);
-    }
-  }
-  if (!first || !last) return null;
-  const covered = Math.min(windowMs, last.time - first.time + 1e3);
-  return {
-    covered_s: Math.round(covered / 1e3),
-    volume: sig(volume),
-    notional_usd: usd(notional),
-    notional_raw: notional,
-    buy_volume: sig(buy),
-    sell_volume: sig(sell),
-    delta: sig(buy - sell),
-    buy_pct: volume ? fixed(buy / volume * 100, 1) : null,
-    trades,
-    price_change_pct: first.open ? pct((last.close - first.open) / first.open) : null,
-    high: Number.isFinite(high) ? high : null,
-    low: Number.isFinite(low) ? low : null
-  };
-}
-function publicWindow(w) {
-  if (!w) return null;
-  const { notional_raw: _raw, ...rest } = w;
-  return rest;
-}
-function latestVolumeZ(market, seconds, window = 20) {
-  const bars = resampleBars(market.state.flowBars, seconds);
-  if (bars.length < 5) return null;
-  const z2 = rollingVolumeZScores(bars, window);
-  return fixed(z2[z2.length - 1]?.z ?? null, 2);
-}
-function realizedVol(market, seconds, window) {
-  const bars = resampleBars(market.state.flowBars, seconds);
-  if (bars.length < 12) return null;
-  const rv = rollingRealizedVolatility(bars, window, seconds, secondsPerYear(market.spec.marketType));
-  return fixed(rv[rv.length - 1]?.value ?? null, 1);
-}
-function depthWithin(market, mid, bands) {
-  const sides = market.manager.getDepthSides();
-  const out = bands.map((band) => ({ band_pct: band * 100, bid: 0, ask: 0 }));
-  for (const side of sides.values()) {
-    for (const [price, size] of side.bids) {
-      const d = (mid - price) / mid;
-      for (let i = 0; i < bands.length; i++) if (d >= 0 && d <= bands[i]) out[i].bid += size;
-    }
-    for (const [price, size] of side.asks) {
-      const d = (price - mid) / mid;
-      for (let i = 0; i < bands.length; i++) if (d >= 0 && d <= bands[i]) out[i].ask += size;
-    }
-  }
-  return out.map((b) => ({
-    band_pct: b.band_pct,
-    bid_size: sig(b.bid),
-    ask_size: sig(b.ask),
-    bid_usd: usd(b.bid * mid),
-    ask_usd: usd(b.ask * mid),
-    imbalance: b.bid + b.ask ? fixed((b.bid - b.ask) / (b.bid + b.ask), 3) : null
-  }));
-}
-function snapshotView(market) {
-  const s = market.state;
-  const p = pricer(market);
-  const session = s.session;
-  const book = s.aggregatedBook;
-  const quote = referenceQuote(market);
-  const profile = s.volumeProfile;
-  const ref = referenceLast(market);
-  const last = ref?.price ?? session?.last ?? s.ticker?.price ?? null;
-  const t = now(market);
-  const sigmaFromVwap = sigmaFromVwapOf(market);
-  const valueLocation = profile && last ? last > profile.vah ? "above_value_area" : last < profile.val ? "below_value_area" : "inside_value_area" : null;
-  const deriv = s.derivatives;
-  const oi5 = oiWindowChange(s.oiHistory, 5 * 6e4);
-  const liq5 = summarizeLiquidations(s.liquidations, t - 5 * 6e4);
-  const big5 = s.bigTrades.filter((b) => b.timestamp >= t - 5 * 6e4);
-  const micro = s.microEvents.filter((e) => e.time >= t - 15 * 6e4).slice(-5).reverse();
-  const w1 = flowWindow(market, 6e4);
-  const w5 = flowWindow(market, 5 * 6e4);
-  const w15 = flowWindow(market, 15 * 6e4);
-  const volZ1m = latestVolumeZ(market, 60);
-  const bandDepth = quote?.mid ? depthWithin(market, quote.mid, [1e-3, 5e-3, 0.01]) : null;
-  const signals = [];
-  if (sigmaFromVwap !== null) {
-    if (sigmaFromVwap >= 2) signals.push(`Price is ${sigmaFromVwap.toFixed(1)}\u03C3 above session VWAP (stretched).`);
-    else if (sigmaFromVwap <= -2) signals.push(`Price is ${Math.abs(sigmaFromVwap).toFixed(1)}\u03C3 below session VWAP (stretched).`);
-    else signals.push(`Price is ${sigmaFromVwap >= 0 ? "above" : "below"} session VWAP (${sigmaFromVwap.toFixed(2)}\u03C3).`);
-  }
-  if (valueLocation) signals.push(`Price is ${valueLocation.replace(/_/g, " ")} (VAL ${p(profile.val)} \u2013 VAH ${p(profile.vah)}, POC ${p(profile.poc)}).`);
-  if (w5 && w5.buy_pct !== null) {
-    if (w5.buy_pct >= 60) signals.push(`Aggressive buyers dominate the last 5m (${w5.buy_pct}% of volume).`);
-    else if (w5.buy_pct <= 40) signals.push(`Aggressive sellers dominate the last 5m (${(100 - w5.buy_pct).toFixed(1)}% of volume).`);
-    const pc = w5.price_change_pct ?? 0;
-    if (w5.delta !== null && Math.abs(pc) > 0.05 && Math.sign(pc) !== Math.sign(w5.delta)) {
-      signals.push(`Delta divergence over 5m: price ${pc > 0 ? "up" : "down"} ${Math.abs(pc)}% while delta is ${w5.delta > 0 ? "positive" : "negative"}.`);
-    }
-  }
-  if (volZ1m !== null && volZ1m >= 2.5) signals.push(`Volume spike: last 1m volume z-score ${volZ1m}.`);
-  if (s.currentOBI >= 0.3) signals.push(`Order book is bid-heavy near the touch (OBI ${s.currentOBI.toFixed(2)}).`);
-  else if (s.currentOBI <= -0.3) signals.push(`Order book is ask-heavy near the touch (OBI ${s.currentOBI.toFixed(2)}).`);
-  if (oi5 && oi5.regime !== "neutral") signals.push(`OI regime (5m): ${OI_REGIME_LABEL[oi5.regime]} \u2014 ${OI_REGIME_HINT[oi5.regime]}`);
-  if (deriv?.fundingRate8h !== null && deriv?.fundingRate8h !== void 0 && Math.abs(deriv.fundingRate8h) >= 3e-4) {
-    signals.push(`Funding is elevated: ${(deriv.fundingRate8h * 100).toFixed(4)}% per 8h (${deriv.fundingRate8h > 0 ? "longs pay shorts" : "shorts pay longs"}).`);
-  }
-  if (liq5.count) signals.push(`Liquidations last 5m: longs ${usd(liq5.longNotional)}, shorts ${usd(liq5.shortNotional)}.`);
-  for (const e of micro.slice(0, 2)) {
-    signals.push(`${e.kind === "absorption" ? "Absorption" : "Iceberg"} at ${p(e.price)}: the ${e.side === "bid" ? "bid held against selling" : "offer held against buying"} (${iso(e.time)}).`);
-  }
-  return {
-    ...header(market),
-    price: {
-      last: p(last),
-      ...ref && market.spec.venues.length > 1 ? { last_note: `median of ${ref.venues} venues' latest prints`, last_print: p(ref.print), last_print_venue: ref.printVenue } : {},
-      mid: p(quote?.mid),
-      spread_bps: fixed(quote?.spread_bps, 2),
-      ...quote && quote.venues > 1 ? {
-        highest_bid: p(quote.best_bid),
-        lowest_ask: p(quote.best_ask),
-        ...quote.crossed ? { cross_venue_crossed: true } : {}
-      } : { best_bid: p(quote?.best_bid), best_ask: p(quote?.best_ask) }
-    },
-    session: session ? {
-      open: p(session.open),
-      high: p(session.high),
-      low: p(session.low),
-      change_pct: session.open && last ? pct((last - session.open) / session.open) : null,
-      vwap: p(session.vwap),
-      vwap_std: p(session.vwapStd),
-      sigma_from_vwap: fixed(sigmaFromVwap, 2),
-      volume: sig(session.volume),
-      notional_usd: usd(session.notional),
-      buy_volume: sig(session.buyVolume),
-      sell_volume: sig(session.sellVolume),
-      delta: sig(session.buyVolume - session.sellVolume),
-      buy_pct: session.volume ? fixed(session.buyVolume / session.volume * 100, 1) : null,
-      trades: session.trades,
-      avg_trade: sig(session.volume / Math.max(1, session.trades)),
-      max_trade: sig(session.maxTrade)
-    } : null,
-    flow: { last_1m: publicWindow(w1), last_5m: publicWindow(w5), last_15m: publicWindow(w15), volume_z_1m: volZ1m, realized_vol_5m_ann_pct: realizedVol(market, 5, 60) },
-    volume_profile: profile ? { poc: p(profile.poc), vah: p(profile.vah), val: p(profile.val), location: valueLocation } : null,
-    order_book: book ? { obi: fixed(s.currentOBI, 3), obi_note: "obi = (bid\u2212ask)/(bid+ask) size near the touch, within the shallowest venue's displayed depth; depth = all resting size within each band of mid", depth: bandDepth } : null,
-    derivatives: market.spec.marketType === "perpetual" && deriv ? {
-      open_interest: sig(deriv.openInterest),
-      open_interest_usd: usd(deriv.openInterestValue),
-      oi_change_5m_pct: oi5 ? pct(oi5.oiChange) : null,
-      oi_regime_5m: oi5 ? oi5.regime : null,
-      funding_8h_pct: pct(deriv.fundingRate8h, 5),
-      funding_annualized_pct: deriv.fundingRate8h !== null ? fixed(annualizeFunding(deriv.fundingRate8h, 8) * 100, 2) : null,
-      next_funding: iso(deriv.nextFundingTime),
-      mark: p(deriv.markPrice),
-      index: p(deriv.indexPrice),
-      basis_bps: fixed(deriv.basisBps, 2)
-    } : null,
-    liquidations_5m: market.spec.marketType === "perpetual" ? { long_usd: usd(liq5.longNotional), short_usd: usd(liq5.shortNotional), count: liq5.count } : null,
-    big_trades_5m: {
-      count: big5.length,
-      buy_usd: usd(big5.filter((b) => b.side === "buy").reduce((a, b) => a + b.quoteVolume, 0)),
-      sell_usd: usd(big5.filter((b) => b.side === "sell").reduce((a, b) => a + b.quoteVolume, 0))
-    },
-    recent_micro_events: micro.map((e) => microRow(e, p)),
-    signals,
-    connections: connectionsView(market)
-  };
-}
-function groupLevels(candle, rowSize) {
-  const rows = /* @__PURE__ */ new Map();
-  for (const l of candle.levels.values()) {
-    const key2 = Math.floor(l.price / rowSize + 1e-9) * rowSize;
-    const r = rows.get(key2) ?? { price: key2, bid: 0, ask: 0, trades: 0 };
-    r.bid += l.bidVolume;
-    r.ask += l.askVolume;
-    r.trades += l.tradeCount;
-    rows.set(key2, r);
-  }
-  return [...rows.values()].sort((a, b) => b.price - a.price);
-}
-function footprintView(market, o) {
-  const p = pricer(market);
-  const tick = market.manager.tickSize || 1;
-  const candles = market.candles(o.timeframe).slice(-o.candles);
-  const out = candles.map((c) => {
-    const span = Math.max(1, Math.round((c.high - c.low) / tick) + 1);
-    const ticksPerRow = o.rowTicks ?? Math.max(1, Math.ceil(span / o.maxRows));
-    const rowSize = Number((ticksPerRow * tick).toPrecision(10));
-    const rows = groupLevels(c, rowSize);
-    let poc = null;
-    for (const r of rows) if (!poc || r.bid + r.ask > poc.bid + poc.ask) poc = r;
-    const pseudo = {
-      ...c,
-      levels: new Map(rows.map((r) => [r.price, { price: r.price, bidVolume: r.bid, askVolume: r.ask }])),
-      sortedPrices: rows.map((r) => r.price).sort((a, b) => a - b)
-    };
-    const stacked = stackedRuns(pseudo, o.imbalanceRatio, o.stackedLevels);
-    return {
-      open_time: iso(c.openTime),
-      complete: c.complete,
-      open: p(c.open),
-      high: p(c.high),
-      low: p(c.low),
-      close: p(c.close),
-      volume: sig(c.volume),
-      delta: sig(c.delta),
-      delta_pct: c.volume ? fixed(c.delta / c.volume * 100, 1) : null,
-      cvd: sig(c.cumulativeDelta),
-      trades: c.tradeCount,
-      poc: poc ? p(poc.price) : null,
-      vwap: p(c.vwap),
-      row_size: rowSize,
-      stacked_imbalances: stacked.map((r) => ({ side: r.dir, from: p(r.start), to: p(r.end) })),
-      ...o.includeRows ? {
-        rows: rows.map((r) => {
-          const imb = imbalanceOf({ bidVolume: r.bid, askVolume: r.ask }, o.imbalanceRatio);
-          return [p(r.price), sig(r.bid, 4), sig(r.ask, 4), sig(r.ask - r.bid, 4), r.trades, imb ?? ""];
-        })
-      } : {}
-    };
-  });
-  return {
-    ...header(market),
-    timeframe: o.timeframe,
-    imbalance_ratio: o.imbalanceRatio,
-    ...o.includeRows ? { row_columns: ["price_low", "bid_vol(sells)", "ask_vol(buys)", "delta", "trades", "imbalance"] } : {},
-    note: "Rows run high\u2192low price. bid_vol = volume sold into the bid, ask_vol = volume bought at the ask. 'buy'/'sell' imbalance = one side \u2265 ratio\xD7 the other at that row.",
-    candles: out
-  };
-}
-function volumeProfileView(market, rows, valueAreaPct) {
-  const p = pricer(market);
-  const base = market.baseCandles();
-  const profile = base.length ? computeVolumeProfile(base, valueAreaPct) : null;
-  if (!profile || !profile.levels.length) return { ...header(market), profile: null };
-  const tick = market.manager.tickSize || 1;
-  const prices = profile.levels.map((l) => l.price);
-  const lo = Math.min(...prices), hi = Math.max(...prices);
-  const ticksPerRow = Math.max(1, Math.ceil((Math.round((hi - lo) / tick) + 1) / rows));
-  const rowSize = Number((ticksPerRow * tick).toPrecision(10));
-  const grouped = /* @__PURE__ */ new Map();
-  for (const l of profile.levels) {
-    const key2 = Math.floor(l.price / rowSize + 1e-9) * rowSize;
-    const g = grouped.get(key2) ?? { vol: 0, bid: 0, ask: 0 };
-    g.vol += l.totalVolume;
-    g.bid += l.bidVolume;
-    g.ask += l.askVolume;
-    grouped.set(key2, g);
-  }
-  const list = [...grouped.entries()].sort((a, b) => b[0] - a[0]);
-  const maxVol = Math.max(...list.map(([, g]) => g.vol));
-  const byVol = [...list].sort((a, b) => b[1].vol - a[1].vol);
-  return {
-    ...header(market),
-    value_area_pct: valueAreaPct * 100,
-    poc: p(profile.poc),
-    vah: p(profile.vah),
-    val: p(profile.val),
-    total_volume: sig(profile.totalVolume),
-    buy_volume: sig(profile.buyVolume),
-    sell_volume: sig(profile.sellVolume),
-    delta: sig(profile.delta),
-    high_volume_nodes: byVol.slice(0, 5).map(([price]) => p(price)),
-    row_size: rowSize,
-    columns: ["price_low", "volume", "buy_vol", "sell_vol", "delta", "pct_of_max"],
-    rows: list.map(([price, g]) => [p(price), sig(g.vol, 4), sig(g.ask, 4), sig(g.bid, 4), sig(g.ask - g.bid, 4), Math.round(g.vol / maxVol * 100)])
-  };
-}
-function groupBook(levels, step, side, depth) {
-  const map = /* @__PURE__ */ new Map();
-  for (const l of levels) {
-    const key2 = side === "bid" ? Math.floor(l.price / step + 1e-9) * step : Math.ceil(l.price / step - 1e-9) * step;
-    map.set(key2, (map.get(key2) ?? 0) + l.size);
-  }
-  return [...map.entries()].sort((a, b) => side === "bid" ? b[0] - a[0] : a[0] - b[0]).slice(0, depth);
-}
-function orderBookView(market, depth, groupTicks, perVenue) {
-  const p = pricer(market);
-  const book = market.state.aggregatedBook;
-  const quote = referenceQuote(market);
-  if (!book || !quote) return { ...header(market), order_book: null, connections: connectionsView(market) };
-  const mid = quote.mid;
-  const tick = market.manager.tickSize || 0;
-  const step = groupTicks > 0 && tick > 0 ? Number((tick * groupTicks).toPrecision(10)) : 0;
-  const bids = step ? groupBook(book.bids, step, "bid", depth) : book.bids.slice(0, depth).map((l) => [l.price, l.size]);
-  const asks = step ? groupBook(book.asks, step, "ask", depth) : book.asks.slice(0, depth).map((l) => [l.price, l.size]);
-  const sizes = [...book.bids, ...book.asks].map((l) => l.size).sort((a, b) => a - b);
-  const median = sizes[Math.floor(sizes.length / 2)] || 0;
-  const walls = [...book.bids.map((l) => ({ ...l, side: "bid" })), ...book.asks.map((l) => ({ ...l, side: "ask" }))].filter((l) => median > 0 && l.size >= median * 5).sort((a, b) => b.size - a.size).slice(0, 8).map((l) => ({ side: l.side, price: p(l.price), size: sig(l.size, 4), usd: usd(l.size * l.price), x_median: fixed(l.size / median, 1), distance_bps: fixed((l.price - mid) / mid * 1e4, 1) }));
-  let cb = 0, ca = 0;
-  const venues = perVenue ? [...market.manager.getBooks().values()].map((b) => ({
-    venue: b.venue,
-    best_bid: p(b.bids[0]?.price),
-    best_ask: p(b.asks[0]?.price),
-    spread_bps: b.bids[0] && b.asks[0] ? fixed((b.asks[0].price - b.bids[0].price) / ((b.asks[0].price + b.bids[0].price) / 2) * 1e4, 2) : null,
-    bid_size_top10: sig(b.bids.slice(0, 10).reduce((a, l) => a + l.size, 0), 4),
-    ask_size_top10: sig(b.asks.slice(0, 10).reduce((a, l) => a + l.size, 0), 4),
-    levels_held: b.bids.length + b.asks.length,
-    updated_s_ago: fixed((Date.now() - b.localTimestamp) / 1e3, 1)
-  })) : void 0;
-  return {
-    ...header(market),
-    mid: p(mid),
-    spread_bps: fixed(quote.spread_bps, 2),
-    ...quote.crossed ? { cross_venue_crossed: true, crossed_note: "Venues quote in USDT, USDC or USD, so the summed book overlaps by a few bps at the touch. mid and spread_bps are medians of each venue's own quote." } : {},
-    obi: fixed(market.state.currentOBI, 3),
-    group_size: step || "raw",
-    columns: ["price", "size", "cumulative_size"],
-    bids: bids.map(([price, size]) => [p(price), sig(size, 5), sig(cb += size, 5)]),
-    asks: asks.map(([price, size]) => [p(price), sig(size, 5), sig(ca += size, 5)]),
-    depth_bands: depthWithin(market, mid, [1e-3, 25e-4, 5e-3, 0.01, 0.02]),
-    walls,
-    ...venues ? { venues } : {},
-    note: "Sizes are base-asset units summed across the venue selection. walls = single price levels \u22655\xD7 the median level size."
-  };
-}
-function tradesView(market, limit, minNotional, side, venue) {
-  const p = pricer(market);
-  const tape = market.manager.getTapeLog();
-  const rows = [];
-  for (const t of tape) {
-    if (rows.length >= limit) break;
-    if (t.quoteVolume < minNotional) continue;
-    if (side && t.side !== side) continue;
-    if (venue && t.venue !== venue) continue;
-    rows.push([iso(t.timestamp), t.venue, t.side, p(t.price), sig(t.quantity), sig(t.quoteVolume, 4)]);
-  }
-  return {
-    ...header(market),
-    tape_size: tape.length,
-    columns: ["time", "venue", "aggressor", "price", "qty", "notional_usd"],
-    trades: rows,
-    note: "Newest first. aggressor 'buy' = market buy lifting the offer."
-  };
-}
-function bigTradesView(market, limit, minRatio, windowMinutes) {
-  const p = pricer(market);
-  const since = now(market) - windowMinutes * 6e4;
-  const list = market.state.bigTrades.filter((b) => b.ratio >= minRatio && b.timestamp >= since);
-  const buy = list.filter((b) => b.side === "buy");
-  const sell = list.filter((b) => b.side === "sell");
-  const session = market.state.session;
-  return {
-    ...header(market),
-    window_minutes: windowMinutes,
-    min_ratio: minRatio,
-    average_print: session ? sig(session.volume / Math.max(1, session.trades)) : null,
-    summary: {
-      count: list.length,
-      buy_count: buy.length,
-      sell_count: sell.length,
-      buy_usd: usd(buy.reduce((a, b) => a + b.quoteVolume, 0)),
-      sell_usd: usd(sell.reduce((a, b) => a + b.quoteVolume, 0))
-    },
-    columns: ["time", "venue", "aggressor", "price", "qty", "notional_usd", "x_avg_print"],
-    trades: list.slice(-limit).reverse().map((b) => [iso(b.timestamp), b.venue, b.side, p(b.price), sig(b.quantity), sig(b.quoteVolume, 4), fixed(b.ratio, 1)]),
-    note: "Prints at least min_ratio\xD7 the session's average print size (counted after a 50-trade warm-up). Newest first."
-  };
-}
-function flowSeriesView(market, intervalSeconds, bars, zWindow) {
-  const p = pricer(market);
-  const resampled = resampleBars(allBars(market), intervalSeconds);
-  const z2 = rollingVolumeZScores(resampled, zWindow);
-  const rv = rollingRealizedVolatility(resampleBars(market.state.flowBars, 1), 300, 1, secondsPerYear(market.spec.marketType));
-  const start = Math.max(0, resampled.length - bars);
-  return {
-    ...header(market),
-    interval_s: intervalSeconds,
-    volume_z_window: zWindow,
-    realized_vol_5m_ann_pct: fixed(rv[rv.length - 1]?.value ?? null, 1),
-    session_cvd: sig(resampled[resampled.length - 1]?.cvd ?? null),
-    columns: ["time", "open", "high", "low", "close", "volume", "buy_vol", "sell_vol", "delta", "cvd", "trades", "volume_z"],
-    bars: resampled.slice(start).map((b, i) => [
-      iso(b.time),
-      p(b.open),
-      p(b.high),
-      p(b.low),
-      p(b.close),
-      sig(b.volume, 4),
-      sig(b.buyVolume, 4),
-      sig(b.sellVolume, 4),
-      sig(b.buyVolume - b.sellVolume, 4),
-      sig(b.cvd, 5),
-      b.trades,
-      fixed(z2[start + i]?.z ?? null, 2)
-    ]),
-    note: "Oldest first. cvd = cumulative (buy \u2212 sell) volume since streaming began. The last bar may still be forming."
-  };
-}
-function derivativesView(market, historyMinutes) {
-  const p = pricer(market);
-  const s = market.state;
-  if (market.spec.marketType !== "perpetual") {
-    return { ...header(market), derivatives: null, note: "Open interest and funding exist for perpetuals only (market_type=perp)." };
-  }
-  const d = s.derivatives;
-  const windows = [1, 5, 15, 60].map((m) => {
-    const c = oiWindowChange(s.oiHistory, m * 6e4);
-    return c ? { window_m: m, oi_change_pct: pct(c.oiChange), oi_change: sig(c.oiDelta), price_change_pct: pct(c.priceChange), regime: c.regime, meaning: OI_REGIME_HINT[c.regime] } : { window_m: m, oi_change_pct: null };
-  });
-  const minute = /* @__PURE__ */ new Map();
-  for (const pt of s.oiHistory) minute.set(Math.floor(pt.time / 6e4) * 6e4, { oi: pt.openInterest, price: pt.price });
-  const series = [...minute.entries()].slice(-historyMinutes);
-  return {
-    ...header(market),
-    aggregate: d ? {
-      open_interest: sig(d.openInterest),
-      open_interest_usd: usd(d.openInterestValue),
-      funding_8h_pct: pct(d.fundingRate8h, 5),
-      funding_annualized_pct: d.fundingRate8h !== null ? fixed(annualizeFunding(d.fundingRate8h, 8) * 100, 2) : null,
-      next_funding: iso(d.nextFundingTime),
-      mark: p(d.markPrice),
-      index: p(d.indexPrice),
-      basis_bps: fixed(d.basisBps, 2)
-    } : null,
-    oi_changes: windows,
-    venues: (d?.venues ?? []).map((v) => ({
-      venue: v.venue,
-      open_interest: sig(v.openInterest ?? null),
-      funding_pct: pct(v.fundingRate ?? null, 5),
-      funding_interval_h: v.fundingIntervalHours ?? null,
-      next_funding: iso(v.nextFundingTime),
-      mark: p(v.markPrice),
-      index: p(v.indexPrice)
-    })),
-    oi_history_columns: ["minute", "open_interest", "price"],
-    oi_history: series.map(([t, v]) => [iso(t), sig(v.oi, 6), p(v.price)]),
-    note: "OI is in base units, summed over venues that report it; funding and basis are OI-weighted. funding_8h normalizes each venue to an 8h interval."
-  };
-}
-function liquidationsView(market, windowMinutes, limit) {
-  const p = pricer(market);
-  const s = market.state;
-  const t = now(market);
-  if (market.spec.marketType !== "perpetual") {
-    return { ...header(market), liquidations: null, note: "Liquidations exist for perpetuals only (market_type=perp)." };
-  }
-  const summary = summarizeLiquidations(s.liquidations, t - windowMinutes * 6e4);
-  const buckets = bucketLiquidations(s.liquidations, 6e4, Math.min(windowMinutes, 240), t);
-  const feeds = market.spec.venues.filter((v) => LIQUIDATION_FEED_VENUES.has(v));
-  return {
-    ...header(market),
-    window_minutes: windowMinutes,
-    venues_with_liquidation_feed: feeds,
-    summary: {
-      long_liquidated_usd: usd(summary.longNotional),
-      short_liquidated_usd: usd(summary.shortNotional),
-      count: summary.count,
-      largest: summary.largest ? { time: iso(summary.largest.timestamp), venue: summary.largest.venue, side: summary.largest.side, price: p(summary.largest.price), usd: usd(summary.largest.quoteVolume) } : null,
-      cascade_now: isLiquidationCascade(buckets, 5, 1e5)
-    },
-    per_minute_columns: ["minute", "long_usd", "short_usd", "count"],
-    per_minute: buckets.filter((b) => b.count).map((b) => [iso(b.time), sig(b.longNotional, 4), sig(b.shortNotional, 4), b.count]),
-    recent_columns: ["time", "venue", "liquidated_side", "price", "qty", "usd"],
-    recent: s.liquidations.slice(-limit).reverse().map((l) => [iso(l.timestamp), l.venue, l.side, p(l.price), sig(l.quantity), sig(l.quoteVolume, 4)]),
-    note: "liquidated_side 'long' = a long was force-closed (forced sell). Coverage depends on which venues publish a liquidation stream."
-  };
-}
-function microRow(e, p) {
-  return {
-    kind: e.kind,
-    side: e.side,
-    meaning: e.kind === "absorption" ? e.side === "bid" ? "passive bids absorbed aggressive selling (support)" : "passive offers absorbed aggressive buying (resistance)" : e.side === "bid" ? "hidden bid refilled (iceberg buyer)" : "hidden offer refilled (iceberg seller)",
-    price: p(e.price),
-    time: iso(e.time),
-    duration_s: fixed((e.time - e.start) / 1e3, 1),
-    volume: sig(e.volume),
-    notional_usd: usd(e.notional),
-    ratio: fixed(e.ratio, 2),
-    ...e.venue ? { venue: e.venue } : {}
-  };
-}
-function microView(market, kind, limit, windowMinutes) {
-  const p = pricer(market);
-  const since = now(market) - windowMinutes * 6e4;
-  const events = market.state.microEvents.filter((e) => e.time >= since && (kind === "all" || e.kind === kind));
-  return {
-    ...header(market),
-    window_minutes: windowMinutes,
-    count: events.length,
-    events: events.slice(-limit).reverse().map((e) => microRow(e, p)),
-    definitions: {
-      absorption: "In a 10s window, aggressive volume at one price \u2265 an average window's total and \u226550% of that side's flow, while price moved \u22641 tick through the level.",
-      iceberg: "On one venue, more than 1.5\xD7 the displayed size (and \u226510\xD7 the average print) traded at a level that kept refilling."
-    }
-  };
-}
-function venuesView(market) {
-  const p = pricer(market);
-  const s = market.state;
-  if (market.spec.venues.length < 2) {
-    return { ...header(market), venues: null, note: "Venue comparison needs a multi-venue selection (venue='all')." };
-  }
-  const summary = venueSummary(s.venueBuckets, now(market));
-  return {
-    ...header(market),
-    window_s: 60,
-    leader: summary.leader ? { venue: summary.leader.venue, lead_ms: summary.leader.leadMs, corr: fixed(summary.leader.leadCorr, 2) } : null,
-    columns: ["venue", "last", "premium_bps", "volume_60s", "share_pct", "delta_60s", "lead_ms", "lead_corr"],
-    venues: summary.stats.map((v) => [v.venue, p(v.last), fixed(v.premiumBps, 2), sig(v.volume, 4), fixed(v.share * 100, 1), sig(v.delta, 4), v.leadMs, fixed(v.leadCorr, 2)]),
-    connections: connectionsView(market),
-    note: "premium vs the median venue price. lead_ms > 0: that venue's price moves first by that many ms (lagged return correlation over the last 2.5 min)."
-  };
-}
-function heatmapView(market, minutes, rows, columns) {
-  const p = pricer(market);
-  const h = market.manager.depthHistory;
-  const t = now(market);
-  const from = h.seqAtOrAfter(t - minutes * 6e4);
-  const to = h.lastSeq;
-  if (to < from || h.size === 0) return { ...header(market), heatmap: null, note: "No depth snapshots yet (sampled once a second once trades and books arrive)." };
-  const tick = h.tick;
-  const mid = referenceQuote(market)?.mid || referenceLast(market)?.price || 0;
-  const band = 0.01;
-  const lo = mid * (1 - band), hi = mid * (1 + band);
-  const ticksPerRow = Math.max(1, Math.ceil((hi - lo) / tick / rows));
-  const rowSize = Number((ticksPerRow * tick).toPrecision(10));
-  const rowOf = (price) => Math.floor(price / rowSize + 1e-9) * rowSize;
-  const firstTime = h.get(from).time;
-  const span = Math.max(1, h.get(to).time - firstTime + 1e3);
-  const colMs = Math.ceil(span / columns / 1e3) * 1e3;
-  const grid2 = /* @__PURE__ */ new Map();
-  const colCount = Math.ceil(span / colMs);
-  const samples = new Array(colCount).fill(0);
-  for (let seq = from; seq <= to; seq++) {
-    const snap = h.get(seq);
-    if (!snap) continue;
-    const col = Math.min(colCount - 1, Math.floor((snap.time - firstTime) / colMs));
-    samples[col]++;
-    for (let i = 0; i < snap.index.length; i++) {
-      const price = snap.index[i] * tick;
-      if (price < lo || price > hi) continue;
-      const r = rowOf(price);
-      let cell = grid2.get(r);
-      if (!cell) {
-        cell = { sum: new Array(colCount).fill(0), n: [] };
-        grid2.set(r, cell);
+  } else {
+    const { MarketHub: MarketHub3 } = await Promise.resolve().then(() => (init_market(), market_exports));
+    const local2 = new MarketHub3({ idleMs: 0, maxMarkets: options2.maxMarkets });
+    hub2 = local2;
+    for (const symbol of options2.symbols) {
+      try {
+        local2.open(symbol, options2.venue, options2.marketType).market.pinned = true;
+      } catch (error2) {
+        lastLog = `${symbol}: ${error2 instanceof Error ? error2.message : error2}`;
       }
-      cell.sum[col] += snap.size[i];
     }
+    view.source = `\xB7 ${options2.venue && options2.venue !== "all" ? options2.venue.toUpperCase() : "ALL VENUES"}`;
+    fetchSnapshot = async () => screenerSnapshot(local2, view.window);
   }
-  const list = [...grid2.entries()].sort((a, b) => b[0] - a[0]).map(([price, cell]) => {
-    const avg = cell.sum.map((v, i) => samples[i] ? v / samples[i] : 0);
-    return { price, avg };
+  let snap = { as_of: Date.now(), window: view.window, rows: [], events: [] };
+  let error = "";
+  let stopped = false;
+  const draw = () => {
+    if (stopped) return;
+    const now2 = Date.now();
+    view.status = error ? `\u26A0 ${error}` : lastLog ? `log: ${lastLog}` : "";
+    out.write(`${ESC}H` + renderFrame(snap, view, out.columns || 120, out.rows || 40, now2));
+  };
+  const refresh = async () => {
+    try {
+      const next = await fetchSnapshot();
+      const now2 = Date.now();
+      for (const r of next.rows) {
+        const prev = lastPrice.get(r.key);
+        if (r.last !== null && prev !== void 0 && r.last !== prev) view.flashes.set(r.key, { up: r.last > prev, until: now2 + 300 });
+        if (r.last !== null) lastPrice.set(r.key, r.last);
+      }
+      snap = next;
+      error = "";
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+    draw();
+  };
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    out.write(`${RESET}${ESC}?25h${ESC}?1049l`);
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    hub2?.dispose();
+    setTimeout(() => process.exit(0), 100).unref();
+  };
+  out.write(`${ESC}?1049h${ESC}?25l${ESC}2J`);
+  out.on("resize", () => {
+    out.write(`${ESC}2J`);
+    draw();
   });
-  const overall = list.map((r) => ({ price: r.price, mean: r.avg.reduce((a, b) => a + b, 0) / colCount, first: r.avg[0], last: r.avg[colCount - 1] }));
-  const sorted = [...overall].sort((a, b) => b.mean - a.mean);
-  const median = [...overall].map((r) => r.mean).sort((a, b) => a - b)[Math.floor(overall.length / 2)] || 0;
-  const walls = sorted.slice(0, 8).map((r) => ({
-    price: p(r.price),
-    side: r.price < mid ? "bid" : "ask",
-    avg_size: sig(r.mean, 4),
-    x_median: median ? fixed(r.mean / median, 1) : null,
-    change_pct: r.first > 0 ? fixed((r.last - r.first) / r.first * 100, 0) : null,
-    trend: r.first > 0 && r.last < r.first * 0.5 ? "pulled" : r.last > r.first * 1.5 ? "added" : "stable"
-  }));
-  return {
-    ...header(market),
-    minutes,
-    mid: p(mid),
-    row_size: rowSize,
-    column_s: colMs / 1e3,
-    column_times: Array.from({ length: colCount }, (_, i) => iso(firstTime + i * colMs)),
-    persistent_walls: walls,
-    columns: ["price_low", "avg_resting_size_per_column\u2026"],
-    rows: list.map((r) => [p(r.price), ...r.avg.map((v) => sig(v, 3))]),
-    note: "Average resting order-book size (base units, all selected venues) per price row and time column, within \xB11% of mid. trend compares the first and last column."
-  };
-}
-function cascadeNow(market, windowMinutes = 30) {
-  if (market.spec.marketType !== "perpetual") return false;
-  const buckets = bucketLiquidations(market.state.liquidations, 6e4, windowMinutes, now(market));
-  return isLiquidationCascade(buckets, 5, 1e5);
-}
-function scanRow(m, last = referenceLast(m)?.price) {
-  const s = m.state;
-  const t = s.marketClock || Date.now();
-  const w5 = flowWindow(m, 5 * 6e4);
-  const sigma = sigmaFromVwapOf(m);
-  const bars = s.flowBars;
-  let volumeZ = null;
-  if (bars.length > 120) {
-    const minutes = /* @__PURE__ */ new Map();
-    for (const b of bars) minutes.set(Math.floor(b.time / 6e4), (minutes.get(Math.floor(b.time / 6e4)) ?? 0) + b.volume);
-    const vols = [...minutes.values()];
-    const lastVolume = vols[vols.length - 2];
-    const base = vols.slice(Math.max(0, vols.length - 22), -2);
-    if (base.length >= 3 && lastVolume !== void 0) {
-      const mean = base.reduce((a, b) => a + b, 0) / base.length;
-      const sd = Math.sqrt(base.reduce((a, b) => a + (b - mean) ** 2, 0) / (base.length - 1));
-      volumeZ = sd > 0 ? (lastVolume - mean) / sd : 0;
-    }
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", (buf) => {
+      const k = buf.toString();
+      if (k === "q" || k === "Q" || k === "" || k === "\x1B") return stop();
+      const windows = Object.keys(SCREENER_WINDOWS);
+      if (k >= "1" && k <= "4") {
+        view.window = windows[Number(k) - 1];
+        void refresh();
+      }
+      if (k === "s" || k === "S") {
+        view.sort = SORTS[(SORTS.indexOf(view.sort) + 1) % SORTS.length];
+        draw();
+      }
+    });
   }
-  const oi5 = oiWindowChange(s.oiHistory, 5 * 6e4);
-  const liq = summarizeLiquidations(s.liquidations, t - 5 * 6e4);
-  return {
-    symbol: m.spec.symbol,
-    ready: m.ready,
-    stream_age_s: Math.round(m.ageMs / 1e3),
-    last: sig(last, 8),
-    change_5m_pct: w5?.price_change_pct ?? null,
-    delta_5m: w5?.delta ?? null,
-    buy_pct_5m: w5?.buy_pct ?? null,
-    notional_5m_usd: w5 ? Math.round(w5.notional_raw) : null,
-    volume_z_1m: fixed(volumeZ, 2),
-    sigma_from_vwap: fixed(sigma, 2),
-    obi: m.ready ? fixed(s.currentOBI, 2) : null,
-    funding_8h_pct: pct(s.derivatives?.fundingRate8h ?? null, 4),
-    oi_change_5m_pct: oi5 ? pct(oi5.oiChange) : null,
-    oi_regime_5m: oi5?.regime ?? null,
-    liquidations_5m_usd: Math.round(liq.longNotional + liq.shortNotional),
-    big_prints_5m: s.bigTrades.filter((b) => b.timestamp >= t - 5 * 6e4).length,
-    live_venues: m.connections().filter((c) => c.status === "live").length + "/" + m.spec.venues.length
-  };
+  let busy = false;
+  const timer = setInterval(() => {
+    if (busy) return draw();
+    busy = true;
+    void refresh().finally(() => {
+      busy = false;
+    });
+  }, 250);
+  await refresh();
 }
-var pct;
-var init_views = __esm({
-  "src/views.ts"() {
+function parseTuiArgs(argv) {
+  const o = { symbols: [], window: "15m", maxMarkets: 20 };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const next = () => argv[++i] ?? "";
+    if (a === "--window" || a === "-w") {
+      const w = next().toLowerCase();
+      if (!(w in SCREENER_WINDOWS)) throw new Error(`--window must be one of ${Object.keys(SCREENER_WINDOWS).join(", ")}`);
+      o.window = w;
+    } else if (a === "--venue") o.venue = next();
+    else if (a === "--spot") o.marketType = "spot";
+    else if (a === "--connect") o.connect = next() || "http://127.0.0.1:3334";
+    else if (a === "--max-markets") o.maxMarkets = Number(next());
+    else if (a.startsWith("-")) throw new Error(`Unknown option ${a}`);
+    else o.symbols.push(...a.split(",").map((s) => s.trim()).filter(Boolean));
+  }
+  if (!o.symbols.length) o.symbols = DEFAULT_TUI_SYMBOLS;
+  return o;
+}
+var ESC, BG, AMBER, WHITE, GREY, DIM, UP, DOWN, CYAN, YELLOW, fg, bg, BOLD, NOBOLD, RESET, dir, plus, BLOCKS, SORTS, COLUMNS, time, KIND, DEFAULT_TUI_SYMBOLS;
+var init_tui = __esm({
+  "src/tui.ts"() {
     "use strict";
-    init_orderFlowEngine();
-    init_imbalance();
-    init_analytics();
-    init_derivatives();
-    init_venues();
-    pct = (x, decimals = 3) => fixed(x === null || x === void 0 ? null : x * 100, decimals);
+    init_screener();
+    ESC = "\x1B[";
+    BG = 16;
+    AMBER = 214;
+    WHITE = 231;
+    GREY = 245;
+    DIM = 240;
+    UP = 46;
+    DOWN = 196;
+    CYAN = 51;
+    YELLOW = 226;
+    fg = (n) => `${ESC}38;5;${n}m`;
+    bg = (n) => `${ESC}48;5;${n}m`;
+    BOLD = `${ESC}1m`;
+    NOBOLD = `${ESC}22m`;
+    RESET = `${ESC}0m`;
+    dir = (x) => x === null || x === void 0 || x === 0 ? WHITE : x > 0 ? UP : DOWN;
+    plus = (x, s) => /^-?[0.,]*%?$/.test(s) ? s.replace(/^-/, "") : (x > 0 ? "+" : "") + s;
+    BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588";
+    SORTS = ["watchlist", "change", "volume", "delta", "liquidations"];
+    COLUMNS = [
+      { title: "TICKER", width: 10, priority: 0, align: "l", draw: (r, w) => cell(r.base, 5, AMBER, "l", BG, true) + cell(r.market_type === "perp" ? "PERP" : "SPOT", w - 5, DIM) },
+      {
+        title: "LAST",
+        width: 13,
+        priority: 0,
+        align: "r",
+        draw: (r, w, view, now2) => {
+          const f = view.flashes.get(r.key);
+          const live = f && f.until > now2;
+          return cell(fmtPrice(r.last, r.decimals), w, live ? f.up ? UP : DOWN : WHITE, "r", live ? f.up ? 22 : 52 : BG, true);
+        }
+      },
+      { title: "NET CHG", width: 11, priority: 5, align: "r", draw: (r, w) => cell(r.change === null ? "\u2014" : plus(r.change, fmtPrice(r.change, r.decimals)), w, dir(r.change), "r") },
+      { title: "%CHG", width: 8, priority: 0, align: "r", draw: (r, w) => cell(r.change_pct === null ? "\u2014" : plus(r.change_pct, r.change_pct.toFixed(2) + "%"), w, dir(r.change_pct), "r", BG, true) },
+      { title: "TREND", width: 22, priority: 1, align: "l", draw: (r, w) => cell(spark(r.spark, w - 1, r.baseline), w, (r.change ?? 0) >= 0 ? UP : DOWN) },
+      { title: "\u0394 5M", width: 9, priority: 1, align: "r", draw: (r, w) => cell(r.delta_5m === null ? "\u2014" : fmtNum(r.delta_5m), w, dir(r.delta_5m), "r") },
+      { title: "BUY%", width: 6, priority: 1, align: "r", draw: (r, w) => cell(r.buy_pct_5m === null ? "\u2014" : r.buy_pct_5m.toFixed(0) + "%", w, r.buy_pct_5m === null ? WHITE : r.buy_pct_5m >= 55 ? UP : r.buy_pct_5m <= 45 ? DOWN : WHITE, "r") },
+      { title: "VOL 5M", width: 9, priority: 6, align: "r", draw: (r, w) => cell(r.notional_5m_usd === null ? "\u2014" : fmtUsd(r.notional_5m_usd), w, WHITE, "r") },
+      { title: "BOOK", width: 7, priority: 3, align: "r", draw: (r, w) => cell(r.obi === null ? "\u2014" : plus(r.obi, r.obi.toFixed(2)), w, dir(r.obi), "r") },
+      { title: "FUND 8H", width: 10, priority: 4, align: "r", draw: (r, w) => cell(r.funding_8h_pct === null ? "\u2014" : r.funding_8h_pct.toFixed(4) + "%", w, dir(r.funding_8h_pct), "r") },
+      { title: "OI 5M", width: 8, priority: 4, align: "r", draw: (r, w) => cell(r.oi_change_5m_pct === null ? "\u2014" : plus(r.oi_change_5m_pct, r.oi_change_5m_pct.toFixed(2) + "%"), w, dir(r.oi_change_5m_pct), "r") },
+      {
+        title: "LIQ 5M L/S",
+        width: 14,
+        priority: 2,
+        align: "r",
+        draw: (r, w) => r.market_type !== "perp" ? cell("\u2014", w, DIM, "r") : cell(`${fmtUsd(r.liq_long_5m_usd)}/${fmtUsd(r.liq_short_5m_usd)}`, w, r.cascade ? YELLOW : r.liq_long_5m_usd + r.liq_short_5m_usd > 0 ? WHITE : DIM, "r")
+      },
+      { title: "VOL Z", width: 6, priority: 7, align: "r", draw: (r, w) => cell(r.volume_z_1m === null ? "\u2014" : r.volume_z_1m.toFixed(1), w, r.volume_z_1m !== null && Math.abs(r.volume_z_1m) >= 3 ? YELLOW : WHITE, "r") },
+      { title: "VWAP \u03C3", width: 7, priority: 7, align: "r", draw: (r, w) => cell(r.sigma_from_vwap === null ? "\u2014" : plus(r.sigma_from_vwap, r.sigma_from_vwap.toFixed(1)), w, r.sigma_from_vwap !== null && Math.abs(r.sigma_from_vwap) >= 2 ? YELLOW : WHITE, "r") },
+      { title: "VENUES", width: 7, priority: 8, align: "r", draw: (r, w) => cell(r.live_venues, w, GREY, "r") },
+      {
+        title: "FLAGS",
+        width: 10,
+        priority: 0,
+        align: "l",
+        draw: (r, w, _v, now2) => r.cascade ? cell(" CASCADE", w, WHITE, "l", Math.floor(now2 / 500) % 2 ? 196 : 88, true) : !r.ready ? cell(" CONNECT", w, GREY) : r.stream_age_s < 60 ? cell(" WARMING", w, GREY) : cell("", w)
+      }
+    ];
+    time = (ms) => new Date(ms).toISOString().slice(11, 19);
+    KIND = { big: "BLOCK", absorption: "ABSORB", iceberg: "ICEBRG", liq: "LIQ" };
+    DEFAULT_TUI_SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE", "SUI"];
   }
 });
 
@@ -5080,7 +6042,7 @@ var server_exports = {};
 __export(server_exports, {
   MarketError: () => MarketError,
   VERSION: () => VERSION,
-  createServer: () => createServer
+  createServer: () => createServer2
 });
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -5090,7 +6052,7 @@ function json(value) {
 function fail(message) {
   return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
 }
-function createServer(hub2, extras2 = {}) {
+function createServer2(hub2, extras2 = {}) {
   const server = new McpServer({ name: "order-flow-mcp", version: VERSION }, { instructions: INSTRUCTIONS });
   async function withMarket(args, fn) {
     try {
@@ -5539,669 +6501,23 @@ Important: data is live and in-memory, and streams continuously while the server
   }
 });
 
-// src/screener-page.ts
-var SCREENER_PAGE;
-var init_screener_page = __esm({
-  "src/screener-page.ts"() {
-    "use strict";
-    SCREENER_PAGE = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark light">
-<title>Order Flow Screener</title>
-<style>
-:root {
-  --bg: #000; --fg: #fff; --muted: #8e8e93; --faint: #48484a; --line: #1c1c1e; --chip: #1c1c1e;
-  --up: #30d158; --down: #ff453a; --up-pill: #34c759; --down-pill: #ff3b30; --pill-fg: #fff;
-  --flat: #636366; --warn: #ffd60a;
-}
-@media (prefers-color-scheme: light) {
-  :root { --bg: #fff; --fg: #000; --muted: #6c6c70; --faint: #c7c7cc; --line: #e5e5ea; --chip: #f2f2f7;
-    --up: #248a3d; --down: #d70015; --flat: #8e8e93; --warn: #b25000; }
-}
-* { box-sizing: border-box; }
-html, body { margin: 0; background: var(--bg); color: var(--fg); }
-body {
-  font: 16px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
-  -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums;
-  padding: 0 16px env(safe-area-inset-bottom);
-}
-main { max-width: 760px; margin: 0 auto; }
-header {
-  position: sticky; top: 0; z-index: 2; background: var(--bg);
-  display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap;
-  padding: 20px 0 12px; border-bottom: 1px solid var(--line);
-}
-h1 { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; margin: 0; }
-.sub { color: var(--muted); font-size: 14px; margin-top: 4px; display: flex; align-items: center; gap: 6px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--up); box-shadow: 0 0 0 0 var(--up); animation: beat 2s infinite; }
-.dot.off { background: var(--flat); animation: none; }
-@keyframes beat { 0% { box-shadow: 0 0 0 0 rgba(48,209,88,.6); } 70% { box-shadow: 0 0 0 7px rgba(48,209,88,0); } 100% { box-shadow: 0 0 0 0 rgba(48,209,88,0); } }
-.seg { display: inline-flex; background: var(--chip); border-radius: 9px; padding: 2px; }
-.seg button {
-  font: inherit; font-size: 13px; font-weight: 600; color: var(--muted); background: none; border: 0;
-  padding: 6px 11px; border-radius: 7px; cursor: pointer;
-}
-.seg button[aria-pressed="true"] { background: var(--faint); color: var(--fg); }
-.row {
-  display: grid; grid-template-columns: minmax(0, 1fr) 128px minmax(108px, auto); column-gap: 16px; align-items: center;
-  padding: 14px 0 12px; border-bottom: 1px solid var(--line);
-}
-.id { min-width: 0; }
-.sym { font-size: 21px; font-weight: 700; letter-spacing: -0.01em; display: flex; align-items: center; gap: 7px; white-space: nowrap; }
-.tag { font-size: 10px; font-weight: 700; color: var(--muted); border: 1px solid var(--faint); border-radius: 4px; padding: 1px 4px; letter-spacing: .04em; }
-.name { color: var(--muted); font-size: 15px; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.badge { font-size: 10px; font-weight: 800; letter-spacing: .05em; border-radius: 4px; padding: 2px 5px; }
-.badge.cascade { background: var(--down-pill); color: #fff; animation: blink 1s steps(2, start) infinite; }
-.badge.warm { color: var(--warn); border: 1px solid currentColor; font-weight: 700; }
-@keyframes blink { to { opacity: .45; } }
-svg.spark { width: 128px; height: 46px; display: block; overflow: visible; }
-.quote { text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
-.px { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; transition: color .5s; }
-.px .d { border-radius: 3px; transition: background-color .6s, color .6s; }
-.px.up .d { color: var(--up); background: rgba(48,209,88,.16); transition: none; }
-.px.down .d { color: var(--down); background: rgba(255,69,58,.16); transition: none; }
-.pill {
-  font: inherit; font-size: 16px; font-weight: 600; min-width: 96px; text-align: right; color: var(--pill-fg);
-  background: var(--flat); border: 0; border-radius: 7px; padding: 5px 9px; cursor: pointer; white-space: nowrap;
-}
-.pill.up { background: var(--up-pill); } .pill.down { background: var(--down-pill); }
-.flow { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-.chip { font-size: 12px; background: var(--chip); color: var(--muted); border-radius: 6px; padding: 3px 7px; white-space: nowrap; }
-.chip b { font-weight: 600; color: var(--fg); }
-.chip b.up { color: var(--up); } .chip b.down { color: var(--down); } .chip.hot { box-shadow: inset 0 0 0 1px var(--warn); }
-.empty { color: var(--muted); padding: 40px 0; text-align: center; line-height: 1.6; }
-.empty code { background: var(--chip); padding: 2px 6px; border-radius: 5px; color: var(--fg); }
-section.tape { margin: 26px 0 10px; }
-section.tape h2 { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 0 0 6px; }
-.ev { display: grid; grid-template-columns: 70px 52px minmax(0, 1fr) auto; gap: 10px; font-size: 14px; padding: 7px 0; border-bottom: 1px solid var(--line); align-items: baseline; }
-.ev .t { color: var(--muted); } .ev .b { font-weight: 700; } .ev .x { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ev .u.up { color: var(--up); } .ev .u.down { color: var(--down); }
-.ev.new { animation: slide .5s ease-out; }
-@keyframes slide { from { background: var(--chip); } to { background: transparent; } }
-footer { color: var(--muted); font-size: 12px; padding: 18px 0 28px; line-height: 1.5; }
-@media (max-width: 480px) {
-  .row { grid-template-columns: minmax(0, 1fr) 84px minmax(96px, auto); column-gap: 10px; }
-  svg.spark { width: 84px; }
-  .sym, .px { font-size: 18px; }
-  .pill { font-size: 14px; min-width: 82px; }
-  .name { font-size: 13px; }
-  .ev { grid-template-columns: 62px 44px minmax(0, 1fr) auto; font-size: 13px; }
-  .chip.minor { display: none; }
-  .chip { font-size: 11px; }
-}
-@media (prefers-reduced-motion: reduce) { .dot, .badge.cascade, .ev.new { animation: none; } }
-</style>
-</head>
-<body>
-<main>
-  <header>
-    <div>
-      <h1>Order Flow</h1>
-      <div class="sub"><span class="dot off" id="dot"></span><span id="status">Connecting\u2026</span></div>
-    </div>
-    <nav class="seg" id="seg" aria-label="Change window">
-      <button data-w="15m">15m</button><button data-w="1h">1h</button><button data-w="4h">4h</button><button data-w="session">Session</button>
-    </nav>
-  </header>
-  <div id="list"></div>
-  <section class="tape" id="tapeBox" hidden>
-    <h2>Live tape</h2>
-    <div id="tape"></div>
-  </section>
-  <footer>
-    Prices are the median of each venue's latest print; change is measured from the start of the selected window
-    (or from when the market began streaming). Markets appear here as soon as your agent streams them.
-    Market data for analysis only, not financial advice.
-  </footer>
-</main>
-<script>
-(function () {
-  "use strict";
-  var params = new URLSearchParams(location.search);
-  var token = params.get("token");
-  var store = {
-    get: function (k, d) { try { return localStorage.getItem("ofs." + k) || d; } catch (e) { return d; } },
-    set: function (k, v) { try { localStorage.setItem("ofs." + k, v); } catch (e) {} }
-  };
-  var win = params.get("window") || store.get("window", "1h");
-  var pillMode = store.get("pill", "pct");
-  var rows = new Map();     // key -> { data, el, refs }
-  var seenEvents = new Set();
-  var listEl = document.getElementById("list");
-  var es = null, lastMsg = 0;
-
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text !== undefined) e.textContent = text;
-    return e;
-  }
-  function svgEl(tag, attrs) {
-    var e = document.createElementNS("http://www.w3.org/2000/svg", tag);
-    for (var k in attrs) e.setAttribute(k, attrs[k]);
-    return e;
-  }
-  function fmtPrice(x, d) {
-    if (x === null || x === undefined) return "\u2014";
-    return x.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
-  }
-  function fmtUsd(x) {
-    var a = Math.abs(x), s = x < 0 ? "-" : "";
-    if (a >= 1e9) return s + "$" + (a / 1e9).toFixed(2) + "B";
-    if (a >= 1e6) return s + "$" + (a / 1e6).toFixed(2) + "M";
-    if (a >= 1e3) return s + "$" + (a / 1e3).toFixed(0) + "K";
-    return s + "$" + a.toFixed(0);
-  }
-  function fmtNum(x) {
-    var a = Math.abs(x);
-    if (a >= 1e6) return (x / 1e6).toFixed(2) + "M";
-    if (a >= 1e3) return (x / 1e3).toFixed(1) + "K";
-    if (a >= 100) return x.toFixed(0);
-    if (a >= 1) return x.toFixed(2);
-    return x.toPrecision(2);
-  }
-  function signed(s, x) { return (x > 0 ? "+" : "") + s; }
-  function dir(x) { return x > 0 ? "up" : x < 0 ? "down" : ""; }
-
-  // \u2500\u2500\u2500 row DOM \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-  function makeRow(d) {
-    var row = el("div", "row");
-    var id = el("div", "id");
-    var sym = el("div", "sym");
-    var symText = el("span", "", d.base);
-    var tag = el("span", "tag", d.market_type === "perp" ? "PERP" : "SPOT");
-    var badges = el("span");
-    sym.append(symText, tag, badges);
-    var venue = d.venue.indexOf("all-") === 0 ? "all venues" : d.venue.replace(/-(futures|spot)$/, "");
-    var name = el("div", "name", d.name + " \xB7 " + venue);
-    id.append(sym, name);
-
-    var svg = svgEl("svg", { class: "spark", viewBox: "0 0 128 46", preserveAspectRatio: "none" });
-    var gid = "g" + Math.random().toString(36).slice(2);
-    var defs = svgEl("defs", {});
-    var grad = svgEl("linearGradient", { id: gid, x1: "0", y1: "0", x2: "0", y2: "1" });
-    var s1 = svgEl("stop", { offset: "0%", "stop-opacity": "0.45" });
-    var s2 = svgEl("stop", { offset: "100%", "stop-opacity": "0" });
-    grad.append(s1, s2); defs.append(grad);
-    var base = svgEl("line", { x1: "0", x2: "128", "stroke-dasharray": "3 3", "stroke-width": "1", "vector-effect": "non-scaling-stroke", opacity: "0.8" });
-    var area = svgEl("path", { fill: "url(#" + gid + ")", stroke: "none" });
-    var line = svgEl("path", { fill: "none", "stroke-width": "1.75", "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke" });
-    svg.append(defs, area, base, line);
-
-    var quote = el("div", "quote");
-    var px = el("div", "px");
-    var pill = el("button", "pill");
-    pill.title = "Tap to switch between % and price change";
-    pill.addEventListener("click", function () {
-      pillMode = pillMode === "pct" ? "abs" : "pct";
-      store.set("pill", pillMode);
-      rows.forEach(function (r) { renderQuote(r, false); });
-    });
-    quote.append(px, pill);
-    var flow = el("div", "flow");
-    row.append(id, svg, quote, flow);
-    return { el: row, refs: { badges: badges, s1: s1, s2: s2, base: base, area: area, line: line, px: px, pill: pill, flow: flow, svg: svg }, shown: null, flashTimer: 0 };
-  }
-
-  function renderSpark(r) {
-    var d = r.data, refs = r.refs;
-    var vals = d.spark.slice();
-    if (d.last !== null && vals.length) vals[vals.length - 1] = d.last;
-    var pts = [];
-    var lo = Infinity, hi = -Infinity;
-    for (var i = 0; i < vals.length; i++) if (vals[i] !== null) { lo = Math.min(lo, vals[i]); hi = Math.max(hi, vals[i]); }
-    if (!isFinite(lo)) { refs.line.setAttribute("d", ""); refs.area.setAttribute("d", ""); refs.base.setAttribute("opacity", "0"); return; }
-    if (d.baseline !== null) { lo = Math.min(lo, d.baseline); hi = Math.max(hi, d.baseline); }
-    var pad = (hi - lo) * 0.08 || Math.abs(hi) * 0.0005 || 1;
-    lo -= pad; hi += pad;
-    var W = 128, H = 46, n = vals.length;
-    function y(v) { return (H - ((v - lo) / (hi - lo)) * H).toFixed(2); }
-    for (var j = 0; j < n; j++) if (vals[j] !== null) pts.push([(n > 1 ? (j / (n - 1)) * W : W).toFixed(2), y(vals[j])]);
-    var lineD = "M" + pts.map(function (p) { return p[0] + " " + p[1]; }).join(" L");
-    refs.line.setAttribute("d", lineD);
-    refs.area.setAttribute("d", lineD + " L" + pts[pts.length - 1][0] + " " + H + " L" + pts[0][0] + " " + H + " Z");
-    var up = d.change === null || d.change >= 0;
-    var c = getComputedStyle(document.documentElement).getPropertyValue(up ? "--up" : "--down");
-    refs.line.setAttribute("stroke", c);
-    refs.s1.setAttribute("stop-color", c); refs.s2.setAttribute("stop-color", c);
-    refs.base.setAttribute("stroke", c);
-    if (d.baseline !== null) { var by = y(d.baseline); refs.base.setAttribute("y1", by); refs.base.setAttribute("y2", by); refs.base.setAttribute("opacity", "0.8"); }
-  }
-
-  function renderQuote(r, flash) {
-    var d = r.data, refs = r.refs;
-    var text = fmtPrice(d.last, d.decimals);
-    var prev = r.shown;
-    refs.px.textContent = "";
-    if (flash && prev && prev !== text && prev.length === text.length) {
-      var k = 0;
-      while (k < text.length && text[k] === prev[k]) k++;
-      refs.px.append(document.createTextNode(text.slice(0, k)), el("span", "d", text.slice(k)));
-      var moved = d.last - r.prevPrice;
-      refs.px.classList.remove("up", "down");
-      void refs.px.offsetWidth;
-      refs.px.classList.add(moved >= 0 ? "up" : "down");
-      clearTimeout(r.flashTimer);
-      r.flashTimer = setTimeout(function () { refs.px.classList.remove("up", "down"); }, 450);
-    } else {
-      refs.px.append(el("span", "d", text));
-    }
-    r.shown = text;
-    r.prevPrice = d.last;
-    var ch = d.change;
-    refs.pill.className = "pill " + (ch === null ? "" : dir(ch));
-    if (ch === null) refs.pill.textContent = "\u2014";
-    else if (pillMode === "pct") refs.pill.textContent = signed(d.change_pct.toFixed(2) + "%", d.change_pct);
-    else refs.pill.textContent = signed(fmtPrice(ch, d.decimals), ch);
-  }
-
-  function chip(label, value, cls, hot, minor) {
-    var c = el("span", "chip" + (hot ? " hot" : "") + (minor ? " minor" : ""));
-    c.append(document.createTextNode(label + " "), el("b", cls || "", value));
-    return c;
-  }
-
-  function renderFlow(r) {
-    var d = r.data, refs = r.refs;
-    var chips = [];
-    if (d.delta_5m !== null) chips.push(chip("\u0394 5m", signed(fmtNum(d.delta_5m), d.delta_5m), dir(d.delta_5m)));
-    if (d.buy_pct_5m !== null) chips.push(chip("Buy", d.buy_pct_5m.toFixed(0) + "%", d.buy_pct_5m >= 55 ? "up" : d.buy_pct_5m <= 45 ? "down" : ""));
-    if (d.notional_5m_usd !== null) chips.push(chip("Vol 5m", fmtUsd(d.notional_5m_usd), "", false, true));
-    if (d.volume_z_1m !== null) chips.push(chip("Vol z", d.volume_z_1m.toFixed(1), "", Math.abs(d.volume_z_1m) >= 3, Math.abs(d.volume_z_1m) < 3));
-    if (d.obi !== null) chips.push(chip("Book", signed(d.obi.toFixed(2), d.obi), dir(d.obi)));
-    if (d.sigma_from_vwap !== null) chips.push(chip("VWAP", signed(d.sigma_from_vwap.toFixed(1) + "\u03C3", d.sigma_from_vwap), "", Math.abs(d.sigma_from_vwap) >= 2, Math.abs(d.sigma_from_vwap) < 2));
-    if (d.funding_8h_pct !== null) chips.push(chip("Fund 8h", d.funding_8h_pct.toFixed(4) + "%", dir(d.funding_8h_pct)));
-    if (d.oi_change_5m_pct !== null) chips.push(chip("OI 5m", signed(d.oi_change_5m_pct.toFixed(2) + "%", d.oi_change_5m_pct), dir(d.oi_change_5m_pct)));
-    if (d.market_type === "perp") {
-      var liq = d.liq_long_5m_usd + d.liq_short_5m_usd;
-      chips.push(chip("Liq 5m", liq ? "L " + fmtUsd(d.liq_long_5m_usd) + " \xB7 S " + fmtUsd(d.liq_short_5m_usd) : "$0", "", d.cascade));
-    }
-    if (d.big_prints_5m) chips.push(chip("Big prints", String(d.big_prints_5m), "", false, true));
-    chips.push(chip("Live", d.live_venues, "", false, true));
-    refs.flow.replaceChildren.apply(refs.flow, chips);
-
-    var badges = [];
-    if (d.cascade) badges.push(el("span", "badge cascade", "LIQ CASCADE"));
-    if (!d.ready || d.stream_age_s < 60) badges.push(el("span", "badge warm", d.ready ? "WARMING UP" : "CONNECTING"));
-    refs.badges.replaceChildren.apply(refs.badges, badges);
-  }
-
-  // \u2500\u2500\u2500 stream handling \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-  function onFull(msg) {
-    var keys = new Set();
-    msg.rows.forEach(function (d) {
-      keys.add(d.key);
-      var r = rows.get(d.key);
-      if (!r) { r = makeRow(d); rows.set(d.key, r); }
-      var flash = r.data && r.data.last !== d.last;
-      r.data = d;
-      renderQuote(r, flash);
-      renderSpark(r);
-      renderFlow(r);
-    });
-    rows.forEach(function (r, key) { if (!keys.has(key)) { r.el.remove(); rows.delete(key); } });
-    // Keep DOM order equal to server order.
-    var order = msg.rows.map(function (d) { return rows.get(d.key).el; });
-    var same = order.length === listEl.children.length && order.every(function (e, i) { return listEl.children[i] === e; });
-    if (!same) listEl.replaceChildren.apply(listEl, order);
-    if (!msg.rows.length) {
-      var empty = el("div", "empty");
-      empty.append(document.createTextNode("No markets are streaming yet. Ask your agent to "), el("code", "", "watch_markets"), document.createTextNode(" or "), el("code", "", "open_screener"), document.createTextNode(" with some symbols."));
-      listEl.replaceChildren(empty);
-    }
-    renderTape(msg.events || []);
-    setStatus(true, msg.rows.length);
-  }
-
-  function onTick(msg) {
-    for (var key in msg.p) {
-      var r = rows.get(key);
-      if (!r) continue;
-      var d = r.data, p = msg.p[key];
-      d.last = p;
-      if (d.baseline !== null) { d.change = p - d.baseline; d.change_pct = d.baseline ? ((p - d.baseline) / d.baseline) * 100 : 0; }
-      renderQuote(r, true);
-      renderSpark(r);
-    }
-    lastMsg = Date.now();
-  }
-
-  function renderTape(events) {
-    var box = document.getElementById("tapeBox"), tape = document.getElementById("tape");
-    box.hidden = !events.length;
-    var nodes = events.map(function (e) {
-      var id = e.time + e.base + e.kind + e.usd;
-      var row = el("div", "ev" + (seenEvents.size && !seenEvents.has(id) ? " new" : ""));
-      var t = new Date(e.time);
-      row.append(
-        el("span", "t", t.toLocaleTimeString([], { hour12: false })),
-        el("span", "b", e.base),
-        el("span", "x", e.text),
-        el("span", "u " + (e.side === "buy" ? "up" : "down"), fmtUsd(e.usd))
-      );
-      return { id: id, node: row };
-    });
-    nodes.forEach(function (n) { seenEvents.add(n.id); });
-    if (seenEvents.size > 2000) seenEvents = new Set(nodes.map(function (n) { return n.id; }));
-    tape.replaceChildren.apply(tape, nodes.map(function (n) { return n.node; }));
-  }
-
-  function setStatus(live, count) {
-    lastMsg = Date.now();
-    document.getElementById("dot").className = "dot" + (live ? "" : " off");
-    document.getElementById("status").textContent = live
-      ? "Live \xB7 " + count + (count === 1 ? " market" : " markets") + " \xB7 " + new Date().toLocaleTimeString([], { hour12: false })
-      : "Reconnecting\u2026";
-  }
-
-  function connect() {
-    if (es) es.close();
-    var q = "window=" + encodeURIComponent(win) + (token ? "&token=" + encodeURIComponent(token) : "");
-    es = new EventSource("/screener/stream?" + q);
-    es.addEventListener("full", function (ev) { onFull(JSON.parse(ev.data)); });
-    es.addEventListener("tick", function (ev) { onTick(JSON.parse(ev.data)); });
-    es.onerror = function () { setStatus(false, 0); };
-  }
-  setInterval(function () { if (Date.now() - lastMsg > 5000) setStatus(false, 0); }, 2000);
-
-  var seg = document.getElementById("seg");
-  function markSeg() {
-    Array.prototype.forEach.call(seg.children, function (b) { b.setAttribute("aria-pressed", String(b.dataset.w === win)); });
-  }
-  seg.addEventListener("click", function (ev) {
-    var w = ev.target && ev.target.dataset && ev.target.dataset.w;
-    if (!w || w === win) return;
-    win = w; store.set("window", w); markSeg(); connect();
-  });
-  markSeg();
-  connect();
-})();
-</script>
-</body>
-</html>
-`;
-  }
-});
-
-// src/screener.ts
-var screener_exports = {};
-__export(screener_exports, {
-  SCREENER_WINDOWS: () => SCREENER_WINDOWS,
-  ScreenerService: () => ScreenerService,
-  listenScreener: () => listenScreener,
-  openInBrowser: () => openInBrowser,
-  screenerEvents: () => screenerEvents,
-  screenerRow: () => screenerRow,
-  screenerSnapshot: () => screenerSnapshot,
-  screenerUrl: () => screenerUrl,
-  sparkline: () => sparkline
-});
-import { createServer as createServer2 } from "http";
-import { spawn } from "child_process";
-function livePrice(market) {
-  return referenceLast(market, market.state.recentTrades)?.price ?? null;
-}
-function sparkline(market, windowMs, points = SPARK_POINTS) {
-  const s = market.state;
-  const end = s.marketClock || Date.now();
-  const span = windowMs > 0 ? windowMs : Math.max(6e4, end - market.startedAt);
-  const start = end - span;
-  const bars = s.liveBar ? [...s.flowBars, s.liveBar] : s.flowBars;
-  const candles = market.baseCandles();
-  const useBars = bars.length > 0 && (bars[0].time <= start + 1e3 || !candles.length || candles[0].openTime >= bars[0].time - 6e4);
-  const series = useBars ? bars.filter((b) => b.time >= start && b.trades > 0) : candles.filter((c) => c.closeTime >= start).map((c) => ({ time: c.openTime, open: c.open, close: c.close }));
-  if (!series.length) return null;
-  const step = span / points;
-  const values = [];
-  let i = 0;
-  let last = null;
-  for (let k = 0; k < points; k++) {
-    const bucketEnd = start + (k + 1) * step;
-    while (i < series.length && series[i].time < bucketEnd) last = series[i++].close;
-    values.push(last);
-  }
-  return { base: series[0].open, values };
-}
-function screenerRow(market, windowMs) {
-  const s = market.state;
-  const last = livePrice(market);
-  const spark = sparkline(market, windowMs);
-  const scan = scanRow(market, last ?? void 0);
-  const t = s.marketClock || Date.now();
-  const liq = summarizeLiquidations(s.liquidations, t - 5 * 6e4);
-  const base = market.spec.symbol.replace(/USDT$/, "");
-  const asset = assetFor(market.spec.symbol);
-  const decimals = Math.min(8, getTickDecimals(market.manager.tickSize || 0.01));
-  const baseline = spark?.base ?? null;
-  return {
-    key: market.spec.key,
-    base,
-    name: asset?.name ?? base,
-    color: asset?.color ?? "#888",
-    market_type: market.spec.marketType === "perpetual" ? "perp" : "spot",
-    venue: market.spec.selection,
-    decimals,
-    ready: market.ready,
-    stream_age_s: scan.stream_age_s,
-    last: sig(last, 10),
-    baseline: sig(baseline, 10),
-    change: last !== null && baseline !== null ? last - baseline : null,
-    change_pct: last !== null && baseline ? fixed((last - baseline) / baseline * 100, 3) : null,
-    spark: spark?.values.map((v) => v === null ? null : sig(v, 10)) ?? [],
-    delta_5m: scan.delta_5m,
-    buy_pct_5m: scan.buy_pct_5m,
-    notional_5m_usd: scan.notional_5m_usd,
-    volume_z_1m: scan.volume_z_1m,
-    sigma_from_vwap: scan.sigma_from_vwap,
-    obi: scan.obi,
-    funding_8h_pct: scan.funding_8h_pct,
-    oi_change_5m_pct: scan.oi_change_5m_pct,
-    liq_long_5m_usd: Math.round(liq.longNotional),
-    liq_short_5m_usd: Math.round(liq.shortNotional),
-    cascade: cascadeNow(market),
-    big_prints_5m: scan.big_prints_5m,
-    live_venues: scan.live_venues
-  };
-}
-function screenerEvents(markets, limit = 14, windowMs = 15 * 6e4) {
-  const out = [];
-  for (const m of markets) {
-    const s = m.state;
-    const since = (s.marketClock || Date.now()) - windowMs;
-    const base = m.spec.symbol.replace(/USDT$/, "");
-    for (const b of s.bigTrades.slice(-20)) {
-      if (b.timestamp >= since && b.quoteVolume >= 5e4) out.push({ time: b.timestamp, base, kind: "big", side: b.side, text: `${b.side === "buy" ? "Buy" : "Sell"} print ${fixed(b.ratio, 0)}\xD7 avg`, usd: b.quoteVolume });
-    }
-    for (const e of s.microEvents.slice(-10)) {
-      if (e.time >= since) out.push({ time: e.time, base, kind: e.kind, side: e.side === "bid" ? "buy" : "sell", text: e.kind === "absorption" ? e.side === "bid" ? "Bids absorbing sellers" : "Offers absorbing buyers" : e.side === "bid" ? "Iceberg bid" : "Iceberg offer", usd: e.notional });
-    }
-    for (const l of s.liquidations.slice(-50)) {
-      if (l.timestamp >= since && l.quoteVolume >= 1e5) out.push({ time: l.timestamp, base, kind: "liq", side: l.side === "long" ? "sell" : "buy", text: `${l.side === "long" ? "Long" : "Short"} liquidated`, usd: l.quoteVolume });
-    }
-  }
-  return out.sort((a, b) => b.time - a.time).slice(0, limit);
-}
-function screenerSnapshot(hub2, window) {
-  const markets = hub2.list();
-  return {
-    as_of: Date.now(),
-    window,
-    rows: markets.map((m) => screenerRow(m, SCREENER_WINDOWS[window])),
-    events: screenerEvents(markets)
-  };
-}
-function listenScreener(service, host, port) {
-  return new Promise((resolve, reject) => {
-    let attempt = 0;
-    const tryPort = () => {
-      const server = createServer2((req, res) => {
-        if (!service.handle(req, res)) {
-          res.writeHead(302, { location: "/screener" }).end();
-        }
-      });
-      server.once("error", (error) => {
-        if (error.code === "EADDRINUSE" && attempt < 9) {
-          attempt++;
-          tryPort();
-        } else reject(error);
-      });
-      server.listen(port === 0 ? 0 : port + attempt, host, () => {
-        server.unref();
-        const bound = server.address();
-        resolve({ url: screenerUrl(host, typeof bound === "object" && bound ? bound.port : port + attempt), server });
-      });
-    };
-    tryPort();
-  });
-}
-function screenerUrl(host, port, token) {
-  const shown = host === "0.0.0.0" || host === "::" ? "localhost" : host.includes(":") ? `[${host}]` : host;
-  return `http://${shown}:${port}/screener${token ? `?token=${encodeURIComponent(token)}` : ""}`;
-}
-function openInBrowser(url) {
-  if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return false;
-  try {
-    const [cmd, args] = process.platform === "darwin" ? ["open", [url]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] : ["xdg-open", [url]];
-    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
-    child.on("error", () => {
-    });
-    child.unref();
-    return true;
-  } catch {
-    return false;
-  }
-}
-var SCREENER_WINDOWS, TICK_MS, FULL_MS, SPARK_POINTS, ScreenerService;
-var init_screener = __esm({
-  "src/screener.ts"() {
-    "use strict";
-    init_instruments();
-    init_orderFlowEngine();
-    init_derivatives();
-    init_screener_page();
-    init_views();
-    SCREENER_WINDOWS = { "15m": 15 * 6e4, "1h": 60 * 6e4, "4h": 4 * 60 * 6e4, session: 0 };
-    TICK_MS = 250;
-    FULL_MS = 1e3;
-    SPARK_POINTS = 90;
-    ScreenerService = class {
-      constructor(hub2, token) {
-        this.hub = hub2;
-        this.token = token;
-      }
-      hub;
-      token;
-      clients = /* @__PURE__ */ new Set();
-      tickTimer = null;
-      fullTimer = null;
-      /** Handles /screener, /screener/stream and /screener/data.json; returns false for other paths. */
-      handle(req, res) {
-        const url = new URL(req.url ?? "/", "http://localhost");
-        const path = url.pathname.replace(/\/+$/, "") || "/";
-        if (path !== "/screener" && !path.startsWith("/screener/")) return false;
-        if (this.token && url.searchParams.get("token") !== this.token && req.headers.authorization !== `Bearer ${this.token}`) {
-          res.writeHead(401, { "content-type": "text/plain" }).end("unauthorized: open the screener link with ?token=<token>");
-          return true;
-        }
-        if (req.method !== "GET") {
-          res.writeHead(405, { "content-type": "text/plain" }).end("GET only");
-          return true;
-        }
-        const window = url.searchParams.get("window") ?? "1h";
-        const win = window in SCREENER_WINDOWS ? window : "1h";
-        if (path === "/screener") {
-          res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(SCREENER_PAGE);
-        } else if (path === "/screener/data.json") {
-          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }).end(JSON.stringify(screenerSnapshot(this.hub, win)));
-        } else if (path === "/screener/stream") {
-          this.attach(res, win);
-        } else {
-          res.writeHead(404, { "content-type": "text/plain" }).end("not found");
-        }
-        return true;
-      }
-      attach(res, window) {
-        res.writeHead(200, {
-          "content-type": "text/event-stream",
-          "cache-control": "no-store",
-          connection: "keep-alive",
-          "x-accel-buffering": "no"
-        });
-        res.write("retry: 2000\n\n");
-        const client = { res, window, prices: /* @__PURE__ */ new Map() };
-        this.clients.add(client);
-        res.on("close", () => {
-          this.clients.delete(client);
-          if (!this.clients.size) this.stop();
-        });
-        this.sendFull([client]);
-        this.start();
-      }
-      start() {
-        if (this.tickTimer) return;
-        this.tickTimer = setInterval(() => this.sendTicks(), TICK_MS);
-        this.fullTimer = setInterval(() => this.sendFull([...this.clients]), FULL_MS);
-        this.tickTimer.unref?.();
-        this.fullTimer.unref?.();
-      }
-      stop() {
-        if (this.tickTimer) clearInterval(this.tickTimer);
-        if (this.fullTimer) clearInterval(this.fullTimer);
-        this.tickTimer = this.fullTimer = null;
-      }
-      sendFull(clients) {
-        const byWindow = /* @__PURE__ */ new Map();
-        for (const client of clients) {
-          let payload = byWindow.get(client.window);
-          if (!payload) {
-            const snap = screenerSnapshot(this.hub, client.window);
-            for (const row of snap.rows) client.prices.set(row.key, row.last);
-            payload = `event: full
-data: ${JSON.stringify(snap)}
-
-`;
-            byWindow.set(client.window, payload);
-          }
-          client.res.write(payload);
-        }
-      }
-      sendTicks() {
-        const prices = /* @__PURE__ */ new Map();
-        for (const m of this.hub.list()) prices.set(m.spec.key, sig(livePrice(m), 10));
-        for (const client of this.clients) {
-          const changed = {};
-          let any = false;
-          for (const [key2, price] of prices) {
-            if (price !== null && client.prices.get(key2) !== price) {
-              changed[key2] = price;
-              client.prices.set(key2, price);
-              any = true;
-            }
-          }
-          if (any) client.res.write(`event: tick
-data: ${JSON.stringify({ t: Date.now(), p: changed })}
-
-`);
-        }
-      }
-      close() {
-        this.stop();
-        for (const client of this.clients) client.res.end();
-        this.clients.clear();
-      }
-    };
-  }
-});
-
 // src/index.ts
 import { createServer as createHttpServer } from "http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 var { installNetworking: installNetworking2 } = await Promise.resolve().then(() => (init_net(), net_exports));
 await installNetworking2();
+if (process.argv[2] === "tui") {
+  const { parseTuiArgs: parseTuiArgs2, runTui: runTui2 } = await Promise.resolve().then(() => (init_tui(), tui_exports));
+  try {
+    await runTui2(parseTuiArgs2(process.argv.slice(3)));
+  } catch (error) {
+    console.error(`order-flow-mcp tui: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+  await new Promise(() => {
+  });
+}
 console.log = (...args) => console.error(...args);
 console.info = (...args) => console.error(...args);
 var { MarketHub: MarketHub2 } = await Promise.resolve().then(() => (init_market(), market_exports));
@@ -6244,7 +6560,9 @@ function parseArgs(argv) {
     } else if (a === "--help" || a === "-h") {
       console.error(`order-flow-mcp ${VERSION2} \u2014 live order flow for AI agents (MCP)
 
-Usage: order-flow-mcp [options]
+Usage: order-flow-mcp [options]          MCP server
+       order-flow-mcp tui [BTC,ETH,...]   Live screener in the terminal (--window 15m|1h|4h|session,
+                                          --venue <v>, --spot, --connect <screener URL>; keys 1-4, s, q)
 
   --stdio                 Serve over stdio (default)
   --http                  Serve Streamable HTTP at /mcp

@@ -9,7 +9,7 @@ venue lead/lag and a multi-symbol screener.
 Works with Claude Code, Codex, Cursor, Claude Desktop, VS Code, Windsurf, Gemini CLI, or any client that speaks MCP.
 You don't need API keys or an account, and there's nothing to configure.
 
-**Website:** [zadescoxp.github.io/order-flow-mcp](https://zadescoxp.github.io/order-flow-mcp/) has a setup guide for each agent.
+**Website:** [mcp.order-flow.zadescoxp.com](https://mcp.order-flow.zadescoxp.com) has a setup guide for each agent. The charting app it is built on is at [order-flow.zadescoxp.com](https://order-flow.zadescoxp.com).
 
 ```
 you ▸ What's the order flow on BTC right now?
@@ -159,6 +159,23 @@ by name ("open the screener with BTC, ETH, SOL and DOGE") and they are added. Ov
 `http://127.0.0.1:3334/screener` (or the next free port), and starts on the first `open_screener` call or at
 startup with `--screener`. Over `--http` it is at `/screener` on the same port (add `?token=` when a token is set).
 JSON for your own tools: `/screener/data.json?window=1h`, or the Server-Sent Events stream at `/screener/stream`.
+
+### Terminal screener
+
+Prefer the terminal? Run the same board full-screen, Bloomberg style, in a split pane or a second tab next to
+your agent:
+
+```bash
+npx -y github:zadescoxp/order-flow-mcp tui
+```
+
+It streams BTC, ETH, SOL, XRP, DOGE, BNB, HYPE and SUI perps across every venue by default. Pass your own list
+(`tui BTC,ETH,PEPE`), `--window 15m|1h|4h|session`, `--venue bybit` or `--spot`. To show exactly what your
+agent's server is streaming, with its full history, point it at that server's screener:
+`tui --connect http://127.0.0.1:3334` (stdio, after `open_screener` or with `--screener`) or
+`tui --connect http://localhost:3333` (`--http`). Keys: `1`–`4` change the window, `s` cycles the sort
+(change, volume, delta, liquidations), `q` quits. Prices flash green or red on each tick, and a
+liquidation cascade lights a red banner.
 
 To have the agent keep watch, ask it to use `wait_for`, e.g. "wait for a liquidation cascade on the BTC perp
 and tell me when it happens". Each call waits up to `timeout_seconds` (default 300) and the agent calls it

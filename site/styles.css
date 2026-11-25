@@ -376,6 +376,7 @@ h3 { font-size: 19px; letter-spacing: -0.02em; line-height: 1.25; }
 @media (max-width: 560px) {
   .hero { padding-top: 56px; }
   .star-btn { display: none; }
+  .contribute-btn { display: none; }
   .install { padding-left: 14px; }
   .install code { font-size: 12.5px; }
   .agents { grid-template-columns: 1fr 1fr; }

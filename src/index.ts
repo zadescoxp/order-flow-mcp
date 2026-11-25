@@ -2,6 +2,7 @@
 //
 //   npx -y order-flow-mcp                      stdio (Claude Code, Codex, Cursor, Claude Desktop…)
 //   npx -y order-flow-mcp --http --port 3333   Streamable HTTP at http://localhost:3333/mcp
+//   npx -y order-flow-mcp tui BTC,ETH,SOL       live screener in the terminal
 
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -10,6 +11,18 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 // Global WebSocket (Node 20 has none) and HTTPS_PROXY support for sockets and fetch.
 const { installNetworking } = await import("@/lib/net");
 await installNetworking();
+
+// `tui`: the terminal screener instead of an MCP server.
+if (process.argv[2] === "tui") {
+  const { parseTuiArgs, runTui } = await import("./tui");
+  try {
+    await runTui(parseTuiArgs(process.argv.slice(3)));
+  } catch (error) {
+    console.error(`order-flow-mcp tui: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+  await new Promise(() => {}); // runs until q / Ctrl-C; never fall through to the server below
+}
 
 // Keep stdout clean for the stdio protocol: anything the SDKs log goes to stderr.
 console.log = (...args: unknown[]) => console.error(...args);
@@ -70,7 +83,9 @@ function parseArgs(argv: string[]): Options {
     else if (a === "--help" || a === "-h") {
       console.error(`order-flow-mcp ${VERSION} — live order flow for AI agents (MCP)
 
-Usage: order-flow-mcp [options]
+Usage: order-flow-mcp [options]          MCP server
+       order-flow-mcp tui [BTC,ETH,...]   Live screener in the terminal (--window 15m|1h|4h|session,
+                                          --venue <v>, --spot, --connect <screener URL>; keys 1-4, s, q)
 
   --stdio                 Serve over stdio (default)
   --http                  Serve Streamable HTTP at /mcp

@@ -12,10 +12,12 @@
 - `src/server.ts`: tool definitions. `src/index.ts`: CLI, stdio and Streamable HTTP transports.
 - `src/screener.ts` + `src/screener-page.ts`: the live screener page (`/screener`, SSE at `/screener/stream`),
   served by the HTTP transport or its own loopback server in stdio mode. The page script avoids template
-  literals because it lives inside one. `src/alerts.ts`: `wait_for` conditions.
+  literals because it lives inside one. `src/alerts.ts`: `wait_for` conditions. `src/tui.ts`: the `tui`
+  subcommand, a full-screen ANSI board over the same screener rows (no dependencies; SDK logs are captured).
 - stdout belongs to the stdio protocol: never write to it (console.log is redirected to stderr).
 - `npm test` runs offline through the engine's replay path; `npm run smoke` hits the real exchanges.
 - `dist/` is committed so `npx github:zadescoxp/order-flow-mcp` works without a build. Run `npm run build`
   before committing source changes; CI fails if `dist/` is stale.
-- `site/` is the static website (plain HTML/CSS/JS, deployed to GitHub Pages by `.github/workflows/pages.yml`).
+- `site/` is the static website (plain HTML/CSS/JS), deployed by Vercel to mcp.order-flow.zadescoxp.com via `vercel.json`
+  (no build step; a deploy is skipped unless `site/` or `vercel.json` changed).
   Logo sources and licenses are in `site/assets/CREDITS.md`.

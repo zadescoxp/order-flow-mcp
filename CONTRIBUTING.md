@@ -47,7 +47,7 @@ Node.js 20 or newer is required.
 
 ## Website
 
-The site is static: open `site/index.html` in a browser, or serve it with `npx serve site`. It deploys to GitHub Pages from `main`.
+The site is static: open `site/index.html` in a browser, or serve it with `npx serve site`. It deploys to Vercel ([mcp.order-flow.zadescoxp.com](https://mcp.order-flow.zadescoxp.com)) from `main`; `vercel.json` serves `site/` as-is with no build step.
 
 ## License
 
