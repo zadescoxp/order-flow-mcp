@@ -21,11 +21,10 @@ export type Venue =
   | "kraken-futures"
   | "kraken-spot"
   | "htx-futures"
-  | "htx-spot"
-  | "finnhub-forex";
+  | "htx-spot";
 export type VenueSelection = Venue | "all-perps" | "all-spot";
 
-export type MarketType = "spot" | "perpetual" | "forex";
+export type MarketType = "spot" | "perpetual";
 export type TradeSide = "buy" | "sell";
 export type ConnectionStatus = "connecting" | "live" | "offline" | "error" | "stale";
 
