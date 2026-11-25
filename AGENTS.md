@@ -10,6 +10,12 @@
   timeframes are merged on demand) and `MarketHub` (lazy start, idle close, pinning).
 - `src/views.ts`: engine state → compact JSON. Tables are `{ columns, rows }`.
 - `src/server.ts`: tool definitions. `src/index.ts`: CLI, stdio and Streamable HTTP transports.
+- `src/screener.ts` + `src/screener-page.ts`: the live screener page (`/screener`, SSE at `/screener/stream`),
+  served by the HTTP transport or its own loopback server in stdio mode. The page script avoids template
+  literals because it lives inside one. `src/alerts.ts`: `wait_for` conditions.
+- `src/screener.ts` + `src/screener-page.ts`: the live screener page (`/screener`, SSE at `/screener/stream`),
+  served by the HTTP transport or its own loopback server in stdio mode. The page script avoids template
+  literals because it lives inside one. `src/alerts.ts`: `wait_for` conditions.
 - stdout belongs to the stdio protocol: never write to it (console.log is redirected to stderr).
 - `npm test` runs offline through the engine's replay path; `npm run smoke` hits the real exchanges.
 - `dist/` is committed so `npx github:zadescoxp/order-flow-mcp` works without a build. Run `npm run build`

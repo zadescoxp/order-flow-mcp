@@ -17,6 +17,7 @@ console.info = (...args: unknown[]) => console.error(...args);
 
 const { MarketHub } = await import("./market");
 const { createServer, VERSION } = await import("./server");
+const { ScreenerService, listenScreener, openInBrowser, screenerUrl } = await import("./screener");
 
 interface Options {
   http: boolean;
@@ -26,6 +27,8 @@ interface Options {
   idleMinutes: number;
   maxMarkets: number;
   token?: string;
+  screener: boolean;
+  screenerPort: number;
 }
 
 /** Markets that stream from the moment the server starts, so history is always building. */
@@ -47,6 +50,8 @@ function parseArgs(argv: string[]): Options {
     idleMinutes: Number(env.ORDERFLOW_IDLE_MINUTES ?? 0),
     maxMarkets: Number(env.ORDERFLOW_MAX_MARKETS ?? 20),
     token: env.ORDERFLOW_HTTP_TOKEN || undefined,
+    screener: env.ORDERFLOW_SCREENER === "1" || env.ORDERFLOW_SCREENER === "true",
+    screenerPort: Number(env.ORDERFLOW_SCREENER_PORT ?? 3334),
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -59,6 +64,8 @@ function parseArgs(argv: string[]): Options {
     else if (a === "--idle-minutes") o.idleMinutes = Number(next());
     else if (a === "--max-markets") o.maxMarkets = Number(next());
     else if (a === "--token") o.token = next();
+    else if (a === "--screener") o.screener = true;
+    else if (a === "--screener-port") o.screenerPort = Number(next());
     else if (a === "--version" || a === "-v") { console.error(VERSION); process.exit(0); }
     else if (a === "--help" || a === "-h") {
       console.error(`order-flow-mcp ${VERSION} — live order flow for AI agents (MCP)
@@ -74,6 +81,10 @@ Usage: order-flow-mcp [options]
                           env ORDERFLOW_WATCH)
   --idle-minutes <n>      Close unwatched markets after n idle minutes (default 0 = never)
   --max-markets <n>       Max concurrent markets (default 20)
+  --screener              Start the live screener page at startup (otherwise it starts on the
+                          first open_screener call; env ORDERFLOW_SCREENER=1)
+  --screener-port <n>     Screener port in stdio mode (default 3334, next free port if taken;
+                          env ORDERFLOW_SCREENER_PORT). Over --http it is served at /screener.
 `);
       process.exit(0);
     }
@@ -94,7 +105,26 @@ for (const symbol of options.watch) {
 
 if (options.watch.length) console.error(`[order-flow-mcp] streaming from startup: ${options.watch.join(", ")}`);
 
+const screener = new ScreenerService(hub, options.token);
+let screenerStart: Promise<string> | null = null;
+/** URL of the live screener page, starting its server on first use (stdio mode). */
+function ensureScreener(): Promise<string> {
+  if (options.http) return Promise.resolve(screenerUrl(options.host, options.port, options.token));
+  screenerStart ??= listenScreener(screener, "127.0.0.1", options.screenerPort).then(({ url }) => {
+    console.error(`[order-flow-mcp] live screener at ${url}`);
+    return url;
+  }).catch((error) => {
+    screenerStart = null;
+    throw error;
+  });
+  return screenerStart;
+}
+// Over HTTP the server may be remote, so only open a browser when it is bound to this machine.
+const local = !options.http || ["127.0.0.1", "localhost", "::1"].includes(options.host);
+const extras = { screener: ensureScreener, ...(local ? { openBrowser: openInBrowser } : {}) };
+
 function shutdown() {
+  screener.close();
   hub.dispose();
   setTimeout(() => process.exit(0), 200).unref();
 }
@@ -105,10 +135,11 @@ process.on("unhandledRejection", (reason) => console.error("[order-flow-mcp] unh
 process.on("uncaughtException", (error) => console.error("[order-flow-mcp] uncaught exception:", error));
 
 if (!options.http) {
-  const server = createServer(hub);
+  const server = createServer(hub, extras);
   await server.connect(new StdioServerTransport());
   process.stdin.on("close", shutdown);
   console.error(`[order-flow-mcp] ${VERSION} ready on stdio`);
+  if (options.screener) ensureScreener().catch((error) => console.error(`[order-flow-mcp] screener failed to start: ${error instanceof Error ? error.message : error}`));
 } else {
   const readBody = (req: IncomingMessage) =>
     new Promise<unknown>((resolve, reject) => {
@@ -136,7 +167,8 @@ if (!options.http) {
     if (url.pathname === "/health") {
       return send(res, 200, { ok: true, version: VERSION, markets: hub.list().map((m) => m.spec.key) });
     }
-    if (url.pathname !== "/mcp") return send(res, 404, { error: "MCP endpoint is /mcp" });
+    if (screener.handle(req, res)) return;
+    if (url.pathname !== "/mcp") return send(res, 404, { error: "MCP endpoint is /mcp; the live screener is at /screener" });
     if (options.token && req.headers.authorization !== `Bearer ${options.token}`) {
       return send(res, 401, { error: "unauthorized" });
     }
@@ -147,7 +179,7 @@ if (!options.http) {
     try {
       const body = await readBody(req);
       // Stateless: a fresh protocol server per request, all sharing one market hub.
-      const server = createServer(hub);
+      const server = createServer(hub, extras);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       res.on("close", () => {
         void transport.close();
@@ -161,5 +193,6 @@ if (!options.http) {
   });
   http.listen(options.port, options.host, () => {
     console.error(`[order-flow-mcp] ${VERSION} listening on http://${options.host}:${options.port}/mcp`);
+    console.error(`[order-flow-mcp] live screener at ${screenerUrl(options.host, options.port, options.token)}`);
   });
 }
