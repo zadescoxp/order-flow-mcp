@@ -4218,6 +4218,7 @@ var init_market = __esm({
         return true;
       }
       reap() {
+        if (!(this.options.idleMs > 0)) return;
         const now2 = Date.now();
         for (const market of this.list()) {
           if (!market.pinned && now2 - market.lastAccess > this.options.idleMs) this.close(market.spec.key);
@@ -5278,7 +5279,7 @@ function createServer(hub2) {
     annotations: { readOnlyHint: true }
   }, async () => json({
     max_markets: hub2.options.maxMarkets,
-    idle_close_minutes: hub2.options.idleMs / 6e4,
+    idle_close_minutes: hub2.options.idleMs > 0 ? hub2.options.idleMs / 6e4 : "never",
     markets: hub2.list().map((m) => ({
       symbol: m.spec.symbol,
       market_type: m.spec.marketType,
@@ -5323,7 +5324,7 @@ How to use:
 - Use scan_markets to screen several symbols at once.
 - Defaults: market_type="perp" and venue="all" (every venue listing the market, aggregated). Pass venue="bybit" etc. for one exchange, market_type="spot" for spot.
 
-Important: data is live and in-memory. A market starts streaming the first time it is requested, so all session statistics cover only the time since streaming began (see stream_age_s; warming_up=true for the first minute). Call watch_markets early for markets you will analyze later, and wait before drawing conclusions from a young stream. This is market data for analysis only; it cannot place orders.`;
+Important: data is live and in-memory, and streams continuously while the server runs. The server's watchlist (BTC, ETH and SOL perpetuals by default) streams from startup; any other market starts streaming the first time it is requested and then keeps streaming. Session statistics cover only the time since a market began streaming (see stream_age_s; warming_up=true for the first minute), so wait before drawing conclusions from a young stream. list_active_markets shows what is streaming and for how long; watch_markets pins more markets. This is market data for analysis only; it cannot place orders.`;
     symbolArg = z.string().describe('Asset or symbol, e.g. "BTC", "ETHUSDT", "SOL-PERP".');
     venueArg = z.string().optional().describe('"all" (default, aggregate every venue listing the market) or one exchange: binance, bybit, okx, bitget, hyperliquid, deribit, coinbase, gate, kucoin, kraken, htx.');
     marketTypeArg = z.enum(["perp", "perpetual", "spot"]).optional().describe('"perp" (default) or "spot".');
@@ -5342,14 +5343,19 @@ console.log = (...args) => console.error(...args);
 console.info = (...args) => console.error(...args);
 var { MarketHub: MarketHub2 } = await Promise.resolve().then(() => (init_market(), market_exports));
 var { createServer: createServer2, VERSION: VERSION2 } = await Promise.resolve().then(() => (init_server(), server_exports));
+var DEFAULT_WATCH = "BTC,ETH,SOL";
+function parseWatch(value) {
+  if (value.trim().toLowerCase() === "none") return [];
+  return value.split(",").map((s) => s.trim()).filter(Boolean);
+}
 function parseArgs(argv) {
   const env2 = process.env;
   const o = {
     http: env2.ORDERFLOW_TRANSPORT === "http",
     port: Number(env2.PORT ?? env2.ORDERFLOW_PORT ?? 3333),
     host: env2.ORDERFLOW_HOST ?? "127.0.0.1",
-    watch: (env2.ORDERFLOW_WATCH ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-    idleMinutes: Number(env2.ORDERFLOW_IDLE_MINUTES ?? 30),
+    watch: parseWatch(env2.ORDERFLOW_WATCH ?? DEFAULT_WATCH),
+    idleMinutes: Number(env2.ORDERFLOW_IDLE_MINUTES ?? 0),
     maxMarkets: Number(env2.ORDERFLOW_MAX_MARKETS ?? 20),
     token: env2.ORDERFLOW_HTTP_TOKEN || void 0
   };
@@ -5360,7 +5366,7 @@ function parseArgs(argv) {
     else if (a === "--stdio") o.http = false;
     else if (a === "--port") o.port = Number(next());
     else if (a === "--host") o.host = next();
-    else if (a === "--watch") o.watch.push(...next().split(",").map((s) => s.trim()).filter(Boolean));
+    else if (a === "--watch") o.watch = parseWatch(next());
     else if (a === "--idle-minutes") o.idleMinutes = Number(next());
     else if (a === "--max-markets") o.maxMarkets = Number(next());
     else if (a === "--token") o.token = next();
@@ -5377,8 +5383,9 @@ Usage: order-flow-mcp [options]
   --port <n>              HTTP port (default 3333, env PORT)
   --host <addr>           HTTP bind address (default 127.0.0.1)
   --token <secret>        Require "Authorization: Bearer <secret>" on HTTP (env ORDERFLOW_HTTP_TOKEN)
-  --watch BTC,ETH         Start streaming these markets at boot (env ORDERFLOW_WATCH)
-  --idle-minutes <n>      Close unwatched markets after n idle minutes (default 30)
+  --watch BTC,ETH         Markets that stream from startup (default BTC,ETH,SOL; "none" to disable;
+                          env ORDERFLOW_WATCH)
+  --idle-minutes <n>      Close unwatched markets after n idle minutes (default 0 = never)
   --max-markets <n>       Max concurrent markets (default 20)
 `);
       process.exit(0);
@@ -5395,6 +5402,7 @@ for (const symbol of options.watch) {
     console.error(`[order-flow-mcp] cannot watch ${symbol}: ${error instanceof Error ? error.message : error}`);
   }
 }
+if (options.watch.length) console.error(`[order-flow-mcp] streaming from startup: ${options.watch.join(", ")}`);
 function shutdown() {
   hub.dispose();
   setTimeout(() => process.exit(0), 200).unref();
