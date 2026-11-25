@@ -1,0 +1,6 @@
+order-flow-mcp
+Copyright 2026 order-flow-mcp contributors
+
+src/lib contains the order-flow engine and exchange adapters from
+order-flow-screener (https://github.com/zadescoxp/order-flow-screener),
+licensed under the Apache License 2.0, adapted to run in Node.js.
