@@ -51,7 +51,7 @@ export class LiveMarket {
   /** True once trades and a book have arrived. */
   get ready(): boolean {
     const s = this.state;
-    return (s.session?.trades ?? 0) > 0 && (s.aggregatedBook !== null || this.spec.marketType === "forex");
+    return (s.session?.trades ?? 0) > 0 && s.aggregatedBook !== null;
   }
 
   connections(): VenueConnection[] {
