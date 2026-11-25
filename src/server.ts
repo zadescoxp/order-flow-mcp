@@ -1,0 +1,408 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { ALL_ASSETS } from "@/lib/config/instruments";
+import { FOREX_SYMBOLS } from "@/lib/config/venues";
+import { oiWindowChange, summarizeLiquidations } from "@/lib/engine/derivatives";
+import type { Timeframe, Venue } from "@/lib/types/market";
+import { MarketHub, type LiveMarket } from "./market";
+import { MarketError, PERP_VENUES, resolveMarket, SPOT_VENUES, TIMEFRAMES } from "./resolve";
+import {
+  bigTradesView,
+  connectionsView,
+  derivativesView,
+  fixed,
+  flowSeriesView,
+  flowWindow,
+  footprintView,
+  header,
+  heatmapView,
+  iso,
+  liquidationsView,
+  microView,
+  orderBookView,
+  pct,
+  sig,
+  snapshotView,
+  tradesView,
+  venuesView,
+  volumeProfileView,
+} from "./views";
+
+export const VERSION = "0.1.0";
+
+const INSTRUCTIONS = `Live crypto order-flow data streamed from up to 10 exchanges (Binance, Bybit, OKX, Bitget, Hyperliquid, Deribit, Coinbase, Gate, KuCoin, Kraken, HTX), normalized and aggregated.
+
+How to use:
+- Start with get_market_snapshot for a symbol (e.g. "BTC", "ETH", "SOL"). It returns price, session VWAP, delta, CVD windows, volume profile levels, order-book imbalance, open interest, funding, liquidations, big prints, absorption/iceberg events and plain-language signals.
+- Drill down with get_footprint, get_volume_profile, get_order_book, get_flow_series (CVD / volume z-score), get_derivatives, get_liquidations, get_big_trades, get_trades, get_microstructure_events, get_venue_comparison and get_liquidity_heatmap.
+- Use scan_markets to screen several symbols at once.
+- Defaults: market_type="perp" and venue="all" (every venue listing the market, aggregated). Pass venue="bybit" etc. for one exchange, market_type="spot" for spot.
+
+Important: data is live and in-memory. A market starts streaming the first time it is requested, so all session statistics cover only the time since streaming began (see stream_age_s; warming_up=true for the first minute). Call watch_markets early for markets you will analyze later, and wait before drawing conclusions from a young stream. This is market data for analysis only; it cannot place orders.`;
+
+const symbolArg = z.string().describe('Asset or symbol, e.g. "BTC", "ETHUSDT", "SOL-PERP", or an FX pair like "EUR/USD".');
+const venueArg = z.string().optional().describe('"all" (default, aggregate every venue listing the market) or one exchange: binance, bybit, okx, bitget, hyperliquid, deribit, coinbase, gate, kucoin, kraken, htx.');
+const marketTypeArg = z.enum(["perp", "perpetual", "spot", "forex"]).optional().describe('"perp" (default), "spot", or "forex".');
+const waitArg = z.number().min(0).max(30).optional().describe("Seconds to wait for first data when a market is not streaming yet (default 10).");
+const marketArgs = { symbol: symbolArg, venue: venueArg, market_type: marketTypeArg, wait_seconds: waitArg };
+
+type MarketArgs = { symbol: string; venue?: string; market_type?: string; wait_seconds?: number };
+
+function json(value: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+}
+
+function fail(message: string) {
+  return { content: [{ type: "text" as const, text: JSON.stringify({ error: message }) }], isError: true };
+}
+
+export function createServer(hub: MarketHub): McpServer {
+  const server = new McpServer({ name: "order-flow-mcp", version: VERSION }, { instructions: INSTRUCTIONS });
+
+  /** Resolve + start a market, waiting for first data if it was just opened. */
+  async function withMarket(args: MarketArgs, fn: (market: LiveMarket) => unknown) {
+    try {
+      const { market, created } = hub.open(args.symbol, args.venue, args.market_type);
+      // A young stream waits for its venues to connect (bounded by wait_seconds).
+      if (!market.ready || (!market.settled && market.ageMs < 15_000)) {
+        await market.waitReady(Math.max(0, (args.wait_seconds ?? 10) * 1000 - market.ageMs));
+      }
+      if (!market.ready) {
+        return json({
+          ...header(market),
+          status: created ? "started_streaming_no_data_yet" : "no_data_yet",
+          connections: connectionsView(market),
+          hint: "The stream is connecting or the venues are unreachable/geo-blocked from this server. Retry in a few seconds, or pick another venue.",
+        });
+      }
+      return json(fn(market));
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  const readOnly = { readOnlyHint: true, openWorldHint: true } as const;
+
+  server.registerTool("list_markets", {
+    title: "List markets",
+    description: "Supported assets, which exchanges list each as perpetual or spot, FX pairs, and timeframes. Filter with query (e.g. 'sol', 'meme').",
+    inputSchema: { query: z.string().optional().describe("Case-insensitive filter on ticker or name."), limit: z.number().int().min(1).max(500).optional() },
+    annotations: { readOnlyHint: true },
+  }, async ({ query, limit }) => {
+    const q = query?.trim().toLowerCase();
+    const assets = ALL_ASSETS.filter((a) => !q || a.base.toLowerCase().includes(q) || a.name.toLowerCase().includes(q));
+    return json({
+      count: assets.length,
+      columns: ["symbol", "name", "kind", "perp_venues", "spot_venues"],
+      assets: assets.slice(0, limit ?? 200).map((a) => [`${a.base}USDT`, a.name, a.kind, a.perp.join(","), a.spot.join(",")]),
+      forex_pairs: FOREX_SYMBOLS,
+      forex_note: "FX needs FINNHUB_API_KEY in the server environment; FX quotes have no aggressor side or real depth.",
+      perp_venues: PERP_VENUES,
+      spot_venues: SPOT_VENUES,
+      timeframes: TIMEFRAMES,
+    });
+  });
+
+  server.registerTool("get_market_snapshot", {
+    title: "Market snapshot",
+    description: "One-call overview of live order flow for a market: price/spread, session OHLC & VWAP (σ distance), buy/sell volume & delta over 1m/5m/15m, volume z-score, realized vol, POC/VAH/VAL, order-book imbalance and depth bands, open interest & regime, funding, basis, liquidations, big prints, absorption/iceberg events, plain-language signals and venue connection status.",
+    inputSchema: marketArgs,
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => snapshotView(m)));
+
+  server.registerTool("get_footprint", {
+    title: "Footprint candles",
+    description: "Footprint (bid × ask volume per price row) candles: OHLC, volume, delta, CVD, POC, VWAP, per-row bid/ask volume with imbalance flags, and stacked imbalances. Rows are grouped so each candle has at most max_rows rows.",
+    inputSchema: {
+      ...marketArgs,
+      timeframe: z.enum(["1m", "5m", "15m", "30m", "1h", "4h"]).optional().describe("Candle timeframe (default 5m)."),
+      candles: z.number().int().min(1).max(100).optional().describe("Most recent candles to return (default 6)."),
+      max_rows: z.number().int().min(3).max(200).optional().describe("Max price rows per candle (default 24)."),
+      row_ticks: z.number().int().min(1).max(10000).optional().describe("Fixed row height in ticks (overrides max_rows)."),
+      imbalance_ratio: z.number().min(1.1).max(20).optional().describe("Imbalance ratio: ask/bid or bid/ask volume at the same row (default 3)."),
+      stacked_levels: z.number().int().min(2).max(10).optional().describe("Consecutive imbalanced rows that count as stacked (default 3)."),
+      include_rows: z.boolean().optional().describe("Include per-row volumes (default true). False returns candle summaries only."),
+    },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => footprintView(m, {
+    timeframe: (args.timeframe ?? "5m") as Timeframe,
+    candles: args.candles ?? 6,
+    maxRows: args.max_rows ?? 24,
+    rowTicks: args.row_ticks,
+    imbalanceRatio: args.imbalance_ratio ?? 3,
+    stackedLevels: args.stacked_levels ?? 3,
+    includeRows: args.include_rows ?? true,
+  })));
+
+  server.registerTool("get_volume_profile", {
+    title: "Session volume profile",
+    description: "Volume at price for the streamed session: POC, value area high/low, high-volume nodes, and per-row buy/sell volume and delta.",
+    inputSchema: {
+      ...marketArgs,
+      rows: z.number().int().min(5).max(300).optional().describe("Number of price rows (default 40)."),
+      value_area_pct: z.number().min(50).max(95).optional().describe("Value area percentage (default 70)."),
+    },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => volumeProfileView(m, args.rows ?? 40, (args.value_area_pct ?? 70) / 100)));
+
+  server.registerTool("get_order_book", {
+    title: "Order book",
+    description: "Live aggregated order book: top levels with cumulative size, spread, imbalance, depth within 0.1–2% of mid, large resting walls, and optionally per-venue top of book.",
+    inputSchema: {
+      ...marketArgs,
+      depth: z.number().int().min(1).max(100).optional().describe("Levels per side (default 20)."),
+      group_ticks: z.number().int().min(0).max(10000).optional().describe("Group levels into buckets of N footprint ticks (~1bp each). 0 = raw exchange levels (default)."),
+      per_venue: z.boolean().optional().describe("Include each venue's top of book (default false)."),
+    },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => orderBookView(m, args.depth ?? 20, args.group_ticks ?? 0, args.per_venue ?? false)));
+
+  server.registerTool("get_trades", {
+    title: "Time & sales",
+    description: "Recent executed trades (tape), newest first, with aggressor side and notional. Filter by minimum notional, side or venue.",
+    inputSchema: {
+      ...marketArgs,
+      limit: z.number().int().min(1).max(1000).optional().describe("Max trades (default 50)."),
+      min_notional_usd: z.number().min(0).optional().describe("Only trades at least this notional."),
+      side: z.enum(["buy", "sell"]).optional(),
+      only_venue: z.string().optional().describe("Only trades from this venue id, e.g. bybit-futures."),
+    },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => tradesView(m, args.limit ?? 50, args.min_notional_usd ?? 0, args.side, args.only_venue as Venue | undefined)));
+
+  server.registerTool("get_big_trades", {
+    title: "Big prints",
+    description: "Block / whale prints: trades at least N× the session's average print size, with buy vs sell totals.",
+    inputSchema: {
+      ...marketArgs,
+      min_ratio: z.number().min(5).max(1000).optional().describe("Minimum multiple of the average print (default 10; at least 5)."),
+      window_minutes: z.number().min(1).max(480).optional().describe("Look-back window (default 60)."),
+      limit: z.number().int().min(1).max(500).optional().describe("Max prints listed (default 30)."),
+    },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => bigTradesView(m, args.limit ?? 30, args.min_ratio ?? 10, args.window_minutes ?? 60)));
+
+  server.registerTool("get_flow_series", {
+    title: "Flow bars (CVD, volume z-score)",
+    description: "Time bars of executed flow: OHLC, volume, buy/sell volume, delta, cumulative volume delta (CVD), trade count and rolling volume z-score, plus realized volatility. Built from 1-second bars (2h kept).",
+    inputSchema: {
+      ...marketArgs,
+      interval_seconds: z.number().int().min(1).max(3600).optional().describe("Bar length in seconds (default 60)."),
+      bars: z.number().int().min(1).max(500).optional().describe("Most recent bars (default 60)."),
+      z_window: z.number().int().min(5).max(500).optional().describe("Bars in the volume z-score baseline (default 20)."),
+    },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => flowSeriesView(m, args.interval_seconds ?? 60, args.bars ?? 60, args.z_window ?? 20)));
+
+  server.registerTool("get_derivatives", {
+    title: "Open interest & funding",
+    description: "Perpetuals positioning: aggregate and per-venue open interest, funding (native and 8h-normalized, annualized), next funding, mark/index basis, OI change over 1m/5m/15m/60m with the price × OI regime (new longs, short covering, new shorts, long unwind), and per-minute OI history.",
+    inputSchema: { ...marketArgs, history_minutes: z.number().int().min(1).max(120).optional().describe("Minutes of OI history (default 30).") },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => derivativesView(m, args.history_minutes ?? 30)));
+
+  server.registerTool("get_liquidations", {
+    title: "Liquidations",
+    description: "Forced liquidations on perpetuals: long vs short notional over a window, per-minute buckets, largest liquidation, cascade flag and the latest events.",
+    inputSchema: {
+      ...marketArgs,
+      window_minutes: z.number().min(1).max(240).optional().describe("Look-back window (default 30)."),
+      limit: z.number().int().min(1).max(500).optional().describe("Recent events listed (default 20)."),
+    },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => liquidationsView(m, args.window_minutes ?? 30, args.limit ?? 20)));
+
+  server.registerTool("get_microstructure_events", {
+    title: "Absorption & icebergs",
+    description: "Detected absorption (passive side holding against aggressive flow without price moving) and iceberg orders (hidden size refilling at a level).",
+    inputSchema: {
+      ...marketArgs,
+      kind: z.enum(["all", "absorption", "iceberg"]).optional(),
+      window_minutes: z.number().min(1).max(480).optional().describe("Look-back window (default 60)."),
+      limit: z.number().int().min(1).max(500).optional().describe("Max events (default 20)."),
+    },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => microView(m, args.kind ?? "all", args.limit ?? 20, args.window_minutes ?? 60)));
+
+  server.registerTool("get_venue_comparison", {
+    title: "Venue comparison",
+    description: "Cross-exchange view for an aggregated market: each venue's last price premium vs the median, 60s volume share and delta, and which venue leads price (lag in ms).",
+    inputSchema: marketArgs,
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => venuesView(m)));
+
+  server.registerTool("get_liquidity_heatmap", {
+    title: "Resting liquidity heatmap",
+    description: "Order-book depth over time (sampled every second) within ±1% of mid: average resting size per price row and time column, plus persistent walls and whether they were pulled, added or held.",
+    inputSchema: {
+      ...marketArgs,
+      minutes: z.number().min(1).max(120).optional().describe("Look-back (default 10)."),
+      rows: z.number().int().min(5).max(100).optional().describe("Price rows (default 20)."),
+      columns: z.number().int().min(1).max(60).optional().describe("Time columns (default 10)."),
+    },
+    annotations: readOnly,
+  }, async (args) => withMarket(args, (m) => heatmapView(m, args.minutes ?? 10, args.rows ?? 20, args.columns ?? 10)));
+
+  server.registerTool("scan_markets", {
+    title: "Order-flow screener",
+    description: "Screen several markets side by side: price change, 5m delta and buy %, 5m notional, 1m volume z-score, VWAP distance, book imbalance, funding, 5m OI change, 5m liquidations and big prints. Starts streams that are not running yet.",
+    inputSchema: {
+      symbols: z.array(z.string()).min(1).max(15).optional().describe('Symbols to screen (default BTC, ETH, SOL, XRP, DOGE, BNB, HYPE, SUI).'),
+      venue: venueArg,
+      market_type: marketTypeArg,
+      sort_by: z.enum(["volume_z", "delta_5m", "buy_pct_5m", "change_5m", "notional_5m", "sigma_from_vwap", "oi_change_5m", "liquidations_5m"]).optional().describe("Sort column, descending by absolute value where signed (default notional_5m)."),
+      wait_seconds: waitArg,
+    },
+    annotations: readOnly,
+  }, async (args) => {
+    const symbols = args.symbols ?? ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE", "SUI"];
+    const errors: Record<string, string> = {};
+    const markets: LiveMarket[] = [];
+    for (const symbol of symbols) {
+      try {
+        markets.push(hub.open(symbol, args.venue, args.market_type).market);
+      } catch (error) {
+        errors[symbol] = error instanceof Error ? error.message : String(error);
+      }
+    }
+    await Promise.all(markets.map((m) => (m.ready && m.settled ? true : m.waitReady(Math.max(1000, (args.wait_seconds ?? 10) * 1000 - m.ageMs)))));
+    const rows = markets.map((m) => {
+      const s = m.state;
+      const t = s.marketClock || Date.now();
+      const w5 = flowWindow(m, 5 * 60_000);
+      const session = s.session;
+      const sigma = session && session.vwapStd > 0 ? (session.last - session.vwap) / session.vwapStd : null;
+      const bars = s.flowBars;
+      let volumeZ: number | null = null;
+      if (bars.length > 120) {
+        // last completed minute vs the previous 20 minutes
+        const minutes = new Map<number, number>();
+        for (const b of bars) minutes.set(Math.floor(b.time / 60_000), (minutes.get(Math.floor(b.time / 60_000)) ?? 0) + b.volume);
+        const vols = [...minutes.values()];
+        const last = vols[vols.length - 2];
+        const base = vols.slice(Math.max(0, vols.length - 22), -2);
+        if (base.length >= 3 && last !== undefined) {
+          const mean = base.reduce((a, b) => a + b, 0) / base.length;
+          const sd = Math.sqrt(base.reduce((a, b) => a + (b - mean) ** 2, 0) / (base.length - 1));
+          volumeZ = sd > 0 ? (last - mean) / sd : 0;
+        }
+      }
+      const oi5 = oiWindowChange(s.oiHistory, 5 * 60_000);
+      const liq = summarizeLiquidations(s.liquidations, t - 5 * 60_000);
+      return {
+        symbol: m.spec.symbol,
+        ready: m.ready,
+        stream_age_s: Math.round(m.ageMs / 1000),
+        last: session?.last ?? null,
+        change_5m_pct: w5?.price_change_pct ?? null,
+        delta_5m: w5?.delta ?? null,
+        buy_pct_5m: w5?.buy_pct ?? null,
+        notional_5m_usd: w5 ? Math.round(w5.notional_raw) : null,
+        volume_z_1m: fixed(volumeZ, 2),
+        sigma_from_vwap: fixed(sigma, 2),
+        obi: m.ready ? fixed(s.currentOBI, 2) : null,
+        funding_8h_pct: pct(s.derivatives?.fundingRate8h ?? null, 4),
+        oi_change_5m_pct: oi5 ? pct(oi5.oiChange) : null,
+        oi_regime_5m: oi5?.regime ?? null,
+        liquidations_5m_usd: Math.round(liq.longNotional + liq.shortNotional),
+        big_prints_5m: s.bigTrades.filter((b) => b.timestamp >= t - 5 * 60_000).length,
+        live_venues: m.connections().filter((c) => c.status === "live").length + "/" + m.spec.venues.length,
+      };
+    });
+    const key = ({
+      volume_z: "volume_z_1m", delta_5m: "delta_5m", buy_pct_5m: "buy_pct_5m", change_5m: "change_5m_pct",
+      notional_5m: "notional_5m_usd", sigma_from_vwap: "sigma_from_vwap", oi_change_5m: "oi_change_5m_pct", liquidations_5m: "liquidations_5m_usd",
+    } as const)[args.sort_by ?? "notional_5m"];
+    const signed = key !== "buy_pct_5m" && key !== "notional_5m_usd" && key !== "liquidations_5m_usd";
+    rows.sort((a, b) => {
+      const av = a[key] as number | null, bv = b[key] as number | null;
+      const x = av === null ? -Infinity : signed ? Math.abs(av) : av;
+      const y = bv === null ? -Infinity : signed ? Math.abs(bv) : bv;
+      return y - x;
+    });
+    const keys = rows.length ? Object.keys(rows[0]) : [];
+    return json({
+      as_of: iso(Date.now()),
+      sorted_by: key,
+      columns: keys,
+      rows: rows.map((r) => keys.map((k) => (r as Record<string, unknown>)[k])),
+      ...(Object.keys(errors).length ? { errors } : {}),
+      note: "Notional is base volume × price. Young streams (stream_age_s < 300) have incomplete 5m windows; delta is in base units.",
+    });
+  });
+
+  server.registerTool("watch_markets", {
+    title: "Watch markets",
+    description: "Start streaming markets now and keep them running (pinned, never idle-closed) so history accumulates for later analysis. Returns each market's status.",
+    inputSchema: {
+      symbols: z.array(z.string()).min(1).max(20),
+      venue: venueArg,
+      market_type: marketTypeArg,
+    },
+    annotations: { readOnlyHint: false, openWorldHint: true },
+  }, async ({ symbols, venue, market_type }) => {
+    const out = symbols.map((symbol) => {
+      try {
+        const { market, created } = hub.open(symbol, venue, market_type);
+        market.pinned = true;
+        return { symbol: market.spec.symbol, key: market.spec.key, venues: market.spec.venues, started: created, stream_age_s: Math.round(market.ageMs / 1000) };
+      } catch (error) {
+        return { symbol, error: error instanceof Error ? error.message : String(error) };
+      }
+    });
+    return json({ watching: out });
+  });
+
+  server.registerTool("unwatch_market", {
+    title: "Stop a market",
+    description: "Stop streaming a market and discard its in-memory history.",
+    inputSchema: { symbol: symbolArg, venue: venueArg, market_type: marketTypeArg },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+  }, async ({ symbol, venue, market_type }) => {
+    try {
+      const spec = resolveMarket(symbol, venue, market_type);
+      return json({ stopped: hub.close(spec.key), key: spec.key });
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  server.registerTool("list_active_markets", {
+    title: "Active streams",
+    description: "Markets currently streaming on this server, with age, trade count, pin state and venue connection status.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true },
+  }, async () => json({
+    max_markets: hub.options.maxMarkets,
+    idle_close_minutes: hub.options.idleMs / 60_000,
+    markets: hub.list().map((m) => ({
+      symbol: m.spec.symbol,
+      market_type: m.spec.marketType,
+      venue_selection: m.spec.selection,
+      pinned: m.pinned,
+      stream_age_s: Math.round(m.ageMs / 1000),
+      idle_s: Math.round((Date.now() - m.lastAccess) / 1000),
+      trades: m.state.session?.trades ?? 0,
+      last: m.state.session?.last ?? null,
+      connections: connectionsView(m),
+    })),
+  }));
+
+  server.registerPrompt("analyze_order_flow", {
+    title: "Analyze order flow",
+    description: "Read the live order flow for a market and summarize who is in control, key levels and risks.",
+    argsSchema: { symbol: z.string().describe("e.g. BTC"), timeframe: z.string().optional().describe("Footprint timeframe, default 5m") },
+  }, ({ symbol, timeframe }) => ({
+    messages: [{
+      role: "user",
+      content: {
+        type: "text",
+        text: `Analyze the live order flow for ${symbol}. Call get_market_snapshot first, then get_footprint (timeframe ${timeframe ?? "5m"}), get_volume_profile, get_order_book and, for perpetuals, get_derivatives and get_liquidations. Report: (1) who is in control (aggressor balance, delta/CVD trend, divergences), (2) key levels (POC, VAH/VAL, VWAP ±σ, book walls, absorption/iceberg prices), (3) positioning (OI regime, funding, liquidations), (4) what would change the read. Mention stream_age_s and treat young streams with caution. This is analysis, not financial advice.`,
+      },
+    }],
+  }));
+
+  return server;
+}
+
+export { MarketError };
