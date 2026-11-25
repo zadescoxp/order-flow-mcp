@@ -39,7 +39,7 @@ How to use:
 - Use scan_markets to screen several symbols at once.
 - Defaults: market_type="perp" and venue="all" (every venue listing the market, aggregated). Pass venue="bybit" etc. for one exchange, market_type="spot" for spot.
 
-Important: data is live and in-memory. A market starts streaming the first time it is requested, so all session statistics cover only the time since streaming began (see stream_age_s; warming_up=true for the first minute). Call watch_markets early for markets you will analyze later, and wait before drawing conclusions from a young stream. This is market data for analysis only; it cannot place orders.`;
+Important: data is live and in-memory, and streams continuously while the server runs. The server's watchlist (BTC, ETH and SOL perpetuals by default) streams from startup; any other market starts streaming the first time it is requested and then keeps streaming. Session statistics cover only the time since a market began streaming (see stream_age_s; warming_up=true for the first minute), so wait before drawing conclusions from a young stream. list_active_markets shows what is streaming and for how long; watch_markets pins more markets. This is market data for analysis only; it cannot place orders.`;
 
 const symbolArg = z.string().describe('Asset or symbol, e.g. "BTC", "ETHUSDT", "SOL-PERP".');
 const venueArg = z.string().optional().describe('"all" (default, aggregate every venue listing the market) or one exchange: binance, bybit, okx, bitget, hyperliquid, deribit, coinbase, gate, kucoin, kraken, htx.');
@@ -373,7 +373,7 @@ export function createServer(hub: MarketHub): McpServer {
     annotations: { readOnlyHint: true },
   }, async () => json({
     max_markets: hub.options.maxMarkets,
-    idle_close_minutes: hub.options.idleMs / 60_000,
+    idle_close_minutes: hub.options.idleMs > 0 ? hub.options.idleMs / 60_000 : "never",
     markets: hub.list().map((m) => ({
       symbol: m.spec.symbol,
       market_type: m.spec.marketType,
