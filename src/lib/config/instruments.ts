@@ -43,7 +43,7 @@ const COINS: CryptoAsset[] = COIN_LISTINGS.map((c) => ({
 }));
 
 // Gold and silver as USDT perpetuals: real aggressor-side trades with deep
-// volume (measured live), unlike the sparse spot-FX quote feed.
+// volume (measured live).
 const METAL_VENUES: readonly Venue[] = ["binance-futures", "bybit-futures", "okx-futures", "bitget-futures"];
 export const METALS: CryptoAsset[] = [
   { base: "XAU", name: "Gold", color: "#C9A227", logo: false, kind: "metal", perp: METAL_VENUES, spot: [] },
