@@ -130,13 +130,13 @@ npm run inspect          # MCP Inspector UI
 | `get_liquidity_heatmap` | Resting depth over time within ±1 % of mid, with persistent walls marked pulled, added or held |
 | `scan_markets` | Screener: rank up to 15 symbols by volume z-score, delta, buy %, VWAP stretch, OI change, liquidations… |
 | `watch_markets` / `unwatch_market` / `list_active_markets` | Keep markets streaming in the background so history builds up |
-| `list_markets` | The 120+ supported assets, which venues list each one, FX pairs and timeframes |
+| `list_markets` | The 120+ supported assets, which venues list each one, and timeframes |
 
 There is also an `analyze_order_flow` prompt (a slash command in clients that support MCP prompts).
 
 Every market tool takes `symbol` (`"BTC"`, `"eth"`, `"SOL-PERP"`, `"DOGEUSDT"`…), plus optional `venue`
 (default `"all"`, or one of `binance`, `bybit`, `okx`, `bitget`, `hyperliquid`, `deribit`, `coinbase`, `gate`,
-`kucoin`, `kraken`, `htx`) and `market_type` (`perp` by default, `spot`, or `forex`).
+`kucoin`, `kraken`, `htx`) and `market_type` (`perp` by default, or `spot`).
 
 ### Coverage
 
@@ -144,7 +144,7 @@ Every market tool takes `symbol` (`"BTC"`, `"eth"`, `"SOL-PERP"`, `"DOGEUSDT"`�
 | --- | --- |
 | Perpetuals | Binance, Bybit, OKX, Bitget, Hyperliquid, Deribit, Gate, KuCoin, Kraken, HTX |
 | Spot | Binance, Coinbase, OKX, Bybit, Bitget, Gate, KuCoin, Kraken, HTX |
-| Also | Gold and silver (XAU/XAG) perpetuals, and 20 FX pairs (set `FINNHUB_API_KEY`) |
+| Also | Gold and silver (XAU/XAG) perpetuals |
 
 ## How it works
 
@@ -180,7 +180,6 @@ the agent's context.
 | `--idle-minutes` | `ORDERFLOW_IDLE_MINUTES` | `30` | Close unpinned markets after this much idle time |
 | `--max-markets` | `ORDERFLOW_MAX_MARKETS` | `20` | Upper bound on concurrent markets |
 | | `HTTPS_PROXY` / `ORDERFLOW_PROXY` | – | Send exchange WebSockets and REST calls through an HTTP(S) proxy |
-| | `FINNHUB_API_KEY` | – | Turn on the FX pairs |
 
 To pass env vars from a client config, add `"env": { "ORDERFLOW_WATCH": "BTC,ETH" }` next to `command`.
 
