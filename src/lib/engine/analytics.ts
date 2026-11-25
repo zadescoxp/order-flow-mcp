@@ -7,15 +7,14 @@
 
 import type { FlowBar, FootprintCandle, MarketType, SessionStats } from "@/lib/types/market";
 
-export const SECONDS_PER_YEAR: Record<"crypto" | "forex", number> = {
+export const SECONDS_PER_YEAR: Record<"crypto", number> = {
   // Crypto trades 24/7.
   crypto: 365 * 86_400,
-  // Spot FX trades ~24h × 5 days × 52 weeks.
-  forex: 260 * 86_400,
 };
 
-export function secondsPerYear(marketType: MarketType): number {
-  return marketType === "forex" ? SECONDS_PER_YEAR.forex : SECONDS_PER_YEAR.crypto;
+/** Seconds in a trading year (crypto trades 24/7 on every market type). */
+export function secondsPerYear(_marketType: MarketType): number {
+  return SECONDS_PER_YEAR.crypto;
 }
 
 // ----------------------------------------------------------
@@ -260,12 +259,12 @@ export function applyTradeToSession(
 // Instrument tick size
 // ----------------------------------------------------------
 /**
- * Footprint row size targeting ~1 basis point of price for crypto and
- * ~0.5 bp (≈1 pip on majors) for FX, rounded to a 1/2/2.5/5 × 10ⁿ step.
+ * Footprint row size targeting ~1 basis point of price, rounded to a
+ * 1/2/2.5/5 × 10ⁿ step.
  */
-export function resolveTickSize(price: number, marketType: MarketType): number {
+export function resolveTickSize(price: number, _marketType: MarketType): number {
   if (!Number.isFinite(price) || price <= 0) return 1;
-  const raw = price * (marketType === "forex" ? 0.00005 : 0.0001);
+  const raw = price * 0.0001;
   const exponent = Math.floor(Math.log10(raw));
   const magnitude = 10 ** exponent;
   const normalized = raw / magnitude;
