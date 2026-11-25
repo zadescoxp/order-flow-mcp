@@ -29,7 +29,6 @@ import type {
 import type { MicroEvent } from "@/lib/engine/microstructure";
 import type { VenueBucket } from "@/lib/engine/venues";
 import { RingBuffer } from "@/lib/session/RingBuffer";
-import { isForexVenue } from "@/lib/config/venues";
 
 export type OrderBookMode = "single" | "aggregated" | "compact";
 
@@ -206,7 +205,7 @@ export const createTerminalStore = () => {
       setMarketType: (marketType) =>
         set((s) => {
           // Perp <-> spot keeps the exchange (Bybit Perp → Bybit Spot, All perps → All spot).
-          if (marketType !== "forex" && s.marketType !== "forex" && marketType !== s.marketType) {
+          if (marketType !== s.marketType) {
             const aggregate = s.venue === "all-perps" || s.venue === "all-spot";
             const venue = aggregate
               ? (marketType === "perpetual" ? "all-perps" : "all-spot")
@@ -222,18 +221,14 @@ export const createTerminalStore = () => {
             }
           }
           const isValidVenue =
-            marketType === "forex"
-              ? isForexVenue(s.venue as Venue)
-              : marketType === "perpetual"
-                ? s.venue.includes("futures") || s.venue === "hyperliquid" || s.venue === "deribit" || s.venue === "all-perps"
-                : s.venue.includes("spot");
+            marketType === "perpetual"
+              ? s.venue.includes("futures") || s.venue === "hyperliquid" || s.venue === "deribit" || s.venue === "all-perps"
+              : s.venue.includes("spot");
           const newVenue = isValidVenue
             ? s.venue
-            : marketType === "forex"
-              ? "finnhub-forex"
-              : marketType === "perpetual"
-                ? "bybit-futures"
-                : "bybit-spot";
+            : marketType === "perpetual"
+              ? "bybit-futures"
+              : "bybit-spot";
           return {
             marketType,
             venue: newVenue as VenueSelection,
