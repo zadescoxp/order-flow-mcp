@@ -191,6 +191,9 @@ To pass env vars from a client config, add `"env": { "ORDERFLOW_WATCH": "BTC,ETH
   pass a specific `venue`.
 - Venues quote in USDT, USDC or USD, so an aggregated book can overlap by a few basis points at the touch
   (`cross_venue_crossed: true`). The reported `mid` and `spread_bps` are medians of each venue's own quote.
+- For the same reason, `last` is the median of each venue's latest print, so it doesn't jump when a USD-quoted
+  venue like Deribit or Kraken trades. The snapshot also gives the newest raw print as `last_print` and
+  `last_print_venue`.
 - This server is for market analysis only. It cannot place orders, and nothing it returns is financial advice.
 
 ## Development
