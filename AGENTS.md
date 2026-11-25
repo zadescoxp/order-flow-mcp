@@ -14,3 +14,5 @@
 - `npm test` runs offline through the engine's replay path; `npm run smoke` hits the real exchanges.
 - `dist/` is committed so `npx github:zadescoxp/order-flow-mcp` works without a build. Run `npm run build`
   before committing source changes; CI fails if `dist/` is stale.
+- `site/` is the static website (plain HTML/CSS/JS, deployed to GitHub Pages by `.github/workflows/pages.yml`).
+  Logo sources and licenses are in `site/assets/CREDITS.md`.
