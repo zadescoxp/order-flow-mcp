@@ -4,7 +4,6 @@
 
 import { BaseExchangeAdapter, num } from "./base";
 import type { Venue, LiquidationSide } from "@/lib/types/market";
-import { FinnhubForexAdapter } from "./forex";
 import { BOOK_DEPTH, emitBook } from "./book";
 import { BybitFuturesAdapter, BybitSpotAdapter } from "./bybit";
 import { OKXFuturesAdapter, OKXSpotAdapter } from "./okx";
@@ -129,7 +128,6 @@ export class DeribitAdapter extends BaseExchangeAdapter {
 // ============================================================
 export function createAdapter(venue: Venue, symbol: string): BaseExchangeAdapter | null {
   switch (venue) {
-    case "finnhub-forex": return new FinnhubForexAdapter(symbol);
     case "binance-futures": return new BinanceFuturesAdapter(symbol);
     case "bybit-futures":   return new BybitFuturesAdapter(symbol);
     case "bybit-spot":      return new BybitSpotAdapter(symbol);
