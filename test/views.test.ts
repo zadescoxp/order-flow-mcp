@@ -107,3 +107,27 @@ describe("mergeCandles", () => {
     expect(levelVolume).toBeCloseTo(merged.volume, 9);
   });
 });
+
+describe("referenceLast", () => {
+  it("uses the median of each venue's latest print, not whichever venue printed last", () => {
+    const spec = resolveMarket("BTC"); // all perp venues
+    const m = new LiveMarket(spec, false);
+    markets.push(m);
+    m.manager.beginReplay(
+      { venue: spec.selection, symbol: spec.symbol, marketType: spec.marketType, timeframe: "1m", imbalanceThreshold: 3, selectedVenues: spec.venues },
+      T0
+    );
+    for (let s = 0; s < 60; s++) {
+      const at = T0 + s * 1000;
+      m.manager.ingest("t", trade(at, 100_000, 0.1, "buy", "bybit-futures"), at);
+      m.manager.ingest("t", trade(at + 100, 100_004, 0.1, "sell", "okx-futures"), at + 100);
+      // USD-quoted venue ~5 bps lower, printing last every second
+      m.manager.ingest("t", trade(at + 200, 99_950, 0.1, "buy", "deribit"), at + 200);
+    }
+    m.manager.flushNow();
+    const s = snapshotView(m);
+    expect(s.price.last).toBe(100_000);
+    expect(s.price.last_print).toBe(99_950);
+    expect(s.price.last_print_venue).toBe("deribit");
+  });
+});
