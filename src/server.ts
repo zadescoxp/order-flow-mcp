@@ -3,6 +3,7 @@ import { z } from "zod";
 import { ALL_ASSETS } from "@/lib/config/instruments";
 import { oiWindowChange, summarizeLiquidations } from "@/lib/engine/derivatives";
 import type { Timeframe, Venue } from "@/lib/types/market";
+import { checkConditions, hasCondition, type Hit, type WaitConditions } from "./alerts";
 import { MarketHub, type LiveMarket } from "./market";
 import { MarketError, PERP_VENUES, resolveMarket, SPOT_VENUES, TIMEFRAMES } from "./resolve";
 import {
@@ -21,6 +22,7 @@ import {
   orderBookView,
   pct,
   referenceLast,
+  scanRow,
   sig,
   sigmaFromVwapOf,
   snapshotView,
@@ -37,6 +39,8 @@ How to use:
 - Start with get_market_snapshot for a symbol (e.g. "BTC", "ETH", "SOL"). It returns price, session VWAP, delta, CVD windows, volume profile levels, order-book imbalance, open interest, funding, liquidations, big prints, absorption/iceberg events and plain-language signals.
 - Drill down with get_footprint, get_volume_profile, get_order_book, get_flow_series (CVD / volume z-score), get_derivatives, get_liquidations, get_big_trades, get_trades, get_microstructure_events, get_venue_comparison and get_liquidity_heatmap.
 - Use scan_markets to screen several symbols at once.
+- To watch for something (a liquidation cascade, a price level, a big print, a sharp move), call wait_for: it blocks until the condition fires or times out, so you react within a fraction of a second without polling. Call it again to keep watching.
+- When the user wants to see the market live, call open_screener: it opens a page that updates several times a second with prices, sparklines and order-flow stats for every streaming market.
 - Defaults: market_type="perp" and venue="all" (every venue listing the market, aggregated). Pass venue="bybit" etc. for one exchange, market_type="spot" for spot.
 
 Important: data is live and in-memory, and streams continuously while the server runs. The server's watchlist (BTC, ETH and SOL perpetuals by default) streams from startup; any other market starts streaming the first time it is requested and then keeps streaming. Session statistics cover only the time since a market began streaming (see stream_age_s; warming_up=true for the first minute), so wait before drawing conclusions from a young stream. list_active_markets shows what is streaming and for how long; watch_markets pins more markets. This is market data for analysis only; it cannot place orders.`;
@@ -57,7 +61,14 @@ function fail(message: string) {
   return { content: [{ type: "text" as const, text: JSON.stringify({ error: message }) }], isError: true };
 }
 
-export function createServer(hub: MarketHub): McpServer {
+export interface ServerExtras {
+  /** Starts (if needed) the live screener page and returns its URL. */
+  screener?: () => Promise<string>;
+  /** Opens a URL in the browser of the machine running the server. */
+  openBrowser?: (url: string) => boolean;
+}
+
+export function createServer(hub: MarketHub, extras: ServerExtras = {}): McpServer {
   const server = new McpServer({ name: "order-flow-mcp", version: VERSION }, { instructions: INSTRUCTIONS });
 
   /** Resolve + start a market, waiting for first data if it was just opened. */
@@ -265,49 +276,7 @@ export function createServer(hub: MarketHub): McpServer {
       }
     }
     await Promise.all(markets.map((m) => (m.ready && m.settled ? true : m.waitReady(Math.max(1000, (args.wait_seconds ?? 10) * 1000 - m.ageMs)))));
-    const rows = markets.map((m) => {
-      const s = m.state;
-      const t = s.marketClock || Date.now();
-      const w5 = flowWindow(m, 5 * 60_000);
-      const session = s.session;
-      const sigma = sigmaFromVwapOf(m);
-      const bars = s.flowBars;
-      let volumeZ: number | null = null;
-      if (bars.length > 120) {
-        // last completed minute vs the previous 20 minutes
-        const minutes = new Map<number, number>();
-        for (const b of bars) minutes.set(Math.floor(b.time / 60_000), (minutes.get(Math.floor(b.time / 60_000)) ?? 0) + b.volume);
-        const vols = [...minutes.values()];
-        const last = vols[vols.length - 2];
-        const base = vols.slice(Math.max(0, vols.length - 22), -2);
-        if (base.length >= 3 && last !== undefined) {
-          const mean = base.reduce((a, b) => a + b, 0) / base.length;
-          const sd = Math.sqrt(base.reduce((a, b) => a + (b - mean) ** 2, 0) / (base.length - 1));
-          volumeZ = sd > 0 ? (last - mean) / sd : 0;
-        }
-      }
-      const oi5 = oiWindowChange(s.oiHistory, 5 * 60_000);
-      const liq = summarizeLiquidations(s.liquidations, t - 5 * 60_000);
-      return {
-        symbol: m.spec.symbol,
-        ready: m.ready,
-        stream_age_s: Math.round(m.ageMs / 1000),
-        last: sig(referenceLast(m)?.price, 8),
-        change_5m_pct: w5?.price_change_pct ?? null,
-        delta_5m: w5?.delta ?? null,
-        buy_pct_5m: w5?.buy_pct ?? null,
-        notional_5m_usd: w5 ? Math.round(w5.notional_raw) : null,
-        volume_z_1m: fixed(volumeZ, 2),
-        sigma_from_vwap: fixed(sigma, 2),
-        obi: m.ready ? fixed(s.currentOBI, 2) : null,
-        funding_8h_pct: pct(s.derivatives?.fundingRate8h ?? null, 4),
-        oi_change_5m_pct: oi5 ? pct(oi5.oiChange) : null,
-        oi_regime_5m: oi5?.regime ?? null,
-        liquidations_5m_usd: Math.round(liq.longNotional + liq.shortNotional),
-        big_prints_5m: s.bigTrades.filter((b) => b.timestamp >= t - 5 * 60_000).length,
-        live_venues: m.connections().filter((c) => c.status === "live").length + "/" + m.spec.venues.length,
-      };
-    });
+    const rows = markets.map((m) => scanRow(m));
     const key = ({
       volume_z: "volume_z_1m", delta_5m: "delta_5m", buy_pct_5m: "buy_pct_5m", change_5m: "change_5m_pct",
       notional_5m: "notional_5m_usd", sigma_from_vwap: "sigma_from_vwap", oi_change_5m: "oi_change_5m_pct", liquidations_5m: "liquidations_5m_usd",
@@ -386,6 +355,136 @@ export function createServer(hub: MarketHub): McpServer {
       connections: connectionsView(m),
     })),
   }));
+
+  server.registerTool("open_screener", {
+    title: "Open the live screener",
+    description: "Open a live screener page for the user: a watchlist of every streaming market whose prices, sparklines and order-flow stats (delta, buy %, book imbalance, funding, OI, liquidations, cascade alerts, big prints) update several times a second, plus a live tape of notable events. Pass symbols to add them to the watchlist first. Returns the page URL; on a local server it also opens it in the browser.",
+    inputSchema: {
+      symbols: z.array(z.string()).max(20).optional().describe('Markets to add and pin first, e.g. ["BTC", "ETH", "SOL"]. Markets already streaming are shown either way.'),
+      venue: venueArg,
+      market_type: marketTypeArg,
+      open_browser: z.boolean().optional().describe("Open the page in the default browser of the machine running this server (default true). Set false when the server is remote."),
+    },
+    annotations: { readOnlyHint: false, openWorldHint: true },
+  }, async ({ symbols, venue, market_type, open_browser }) => {
+    if (!extras.screener) return fail("The live screener is not available on this server.");
+    const added: Record<string, unknown>[] = [];
+    for (const symbol of symbols ?? []) {
+      try {
+        const { market } = hub.open(symbol, venue, market_type);
+        market.pinned = true;
+        added.push({ symbol: market.spec.symbol, key: market.spec.key });
+      } catch (error) {
+        added.push({ symbol, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    try {
+      const url = await extras.screener();
+      const opened = open_browser !== false && !!extras.openBrowser?.(url);
+      return json({
+        url,
+        opened_in_browser: opened,
+        ...(added.length ? { added } : {}),
+        markets_on_screen: hub.list().map((m) => m.spec.key),
+        note: opened
+          ? "The screener is open in the user's browser and updates live. Tell the user the URL in case it opened behind other windows."
+          : "Give the user this URL to open; the page updates live. It is served by this MCP server, so it works only while the server runs and from a machine that can reach it.",
+      });
+    } catch (error) {
+      return fail(`Could not start the screener: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+
+  server.registerTool("wait_for", {
+    title: "Wait for a market event",
+    description: "Block until a condition fires on any of the given markets, or until the timeout, instead of polling. Returns which condition fired, on which market, and that market's screener row. Conditions on price level, move %, liquidation cascade and liquidation total fire immediately if already true (check waited_s); big_trade_usd, absorption and iceberg need a new event after the call starts. To keep watching, call again after it returns.",
+    inputSchema: {
+      symbols: z.array(z.string()).min(1).max(10).describe('Markets to watch, e.g. ["BTC"] or ["BTC", "ETH", "SOL"].'),
+      venue: venueArg,
+      market_type: marketTypeArg,
+      price_above: z.number().optional().describe("Fire when the price is at or above this level (use with a single symbol)."),
+      price_below: z.number().optional().describe("Fire when the price is at or below this level (use with a single symbol)."),
+      move_pct: z.number().positive().optional().describe("Fire when the price has moved at least this % (either direction) over move_minutes."),
+      move_minutes: z.number().min(1).max(120).optional().describe("Window for move_pct (default 5)."),
+      liquidation_cascade: z.boolean().optional().describe("Fire on a liquidation cascade: the last minute's liquidations are ≥ $100K and at least 5× a typical (median) minute over the last 30m (perps)."),
+      liquidations_usd: z.number().positive().optional().describe("Fire when liquidations over liquidations_minutes reach this many USD (perps)."),
+      liquidations_minutes: z.number().min(1).max(60).optional().describe("Window for liquidations_usd (default 5)."),
+      big_trade_usd: z.number().positive().optional().describe("Fire on a single print of at least this many USD."),
+      absorption: z.boolean().optional().describe("Fire on a new absorption event."),
+      iceberg: z.boolean().optional().describe("Fire on a new iceberg event."),
+      timeout_seconds: z.number().min(1).max(3600).optional().describe("Give up after this long (default 300). Clients may cut very long calls; on timed_out just call again."),
+    },
+    annotations: readOnly,
+  }, async (args, extra) => {
+    const conditions: WaitConditions = {
+      price_above: args.price_above, price_below: args.price_below, move_pct: args.move_pct, move_minutes: args.move_minutes,
+      liquidation_cascade: args.liquidation_cascade, liquidations_usd: args.liquidations_usd, liquidations_minutes: args.liquidations_minutes,
+      big_trade_usd: args.big_trade_usd, absorption: args.absorption, iceberg: args.iceberg,
+    };
+    if (!hasCondition(conditions)) return fail("Give at least one condition, e.g. liquidation_cascade: true or price_above: 100000.");
+    const markets: LiveMarket[] = [];
+    const wasPinned = new Map<LiveMarket, boolean>();
+    const errors: Record<string, string> = {};
+    for (const symbol of args.symbols) {
+      try {
+        const { market } = hub.open(symbol, args.venue, args.market_type);
+        if (!wasPinned.has(market)) wasPinned.set(market, market.pinned);
+        market.pinned = true; // a watched market must not be idle-closed mid-wait
+        markets.push(market);
+      } catch (error) {
+        errors[symbol] = error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (!markets.length) return fail(Object.entries(errors).map(([k, v]) => `${k}: ${v}`).join("; "));
+    await Promise.all(markets.map((m) => (m.ready ? true : m.waitReady(10_000))));
+
+    const started = Date.now();
+    const timeoutMs = (args.timeout_seconds ?? 300) * 1000;
+    const since = new Map(markets.map((m) => [m, m.state.marketClock || Date.now()]));
+    const progressToken = extra._meta?.progressToken;
+    let nextProgress = started + 15_000;
+    let hit: { market: LiveMarket; hit: Hit } | null = null;
+
+    while (!extra.signal.aborted) {
+      for (const m of markets) {
+        const h = checkConditions(m.touch(), conditions, since.get(m)!);
+        if (h) { hit = { market: m, hit: h }; break; }
+      }
+      if (hit || Date.now() - started >= timeoutMs) break;
+      if (progressToken !== undefined && Date.now() >= nextProgress) {
+        nextProgress += 15_000;
+        await extra.sendNotification({
+          method: "notifications/progress",
+          params: { progressToken, progress: Date.now() - started, total: timeoutMs, message: "Watching " + markets.map((m) => m.spec.symbol).join(", ") },
+        }).catch(() => {});
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    for (const [m, pinned] of wasPinned) m.pinned = pinned;
+    const waited = fixed((Date.now() - started) / 1000, 1);
+    if (hit) {
+      return json({
+        triggered: true,
+        market: hit.market.spec.key,
+        symbol: hit.market.spec.symbol,
+        condition: hit.hit.condition,
+        detail: hit.hit.detail,
+        event_time: hit.hit.time,
+        waited_s: waited,
+        row: scanRow(hit.market),
+        ...(Object.keys(errors).length ? { errors } : {}),
+      });
+    }
+    return json({
+      triggered: false,
+      reason: extra.signal.aborted ? "cancelled" : "timed_out",
+      waited_s: waited,
+      rows: markets.map((m) => scanRow(m)),
+      ...(Object.keys(errors).length ? { errors } : {}),
+      note: "Nothing fired. Call wait_for again to keep watching.",
+    });
+  });
 
   server.registerPrompt("analyze_order_flow", {
     title: "Analyze order flow",

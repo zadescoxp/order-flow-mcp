@@ -4320,8 +4320,7 @@ function connectionsView(market) {
     };
   });
 }
-function referenceLast(market) {
-  const tape = market.manager.getTapeLog();
+function referenceLast(market, tape = market.manager.getTapeLog()) {
   if (!tape.length) return null;
   const wanted = market.spec.venues.length;
   const cutoff = tape[0].timestamp - 6e4;
@@ -4951,6 +4950,52 @@ function heatmapView(market, minutes, rows, columns) {
     note: "Average resting order-book size (base units, all selected venues) per price row and time column, within \xB11% of mid. trend compares the first and last column."
   };
 }
+function cascadeNow(market, windowMinutes = 30) {
+  if (market.spec.marketType !== "perpetual") return false;
+  const buckets = bucketLiquidations(market.state.liquidations, 6e4, windowMinutes, now(market));
+  return isLiquidationCascade(buckets, 5, 1e5);
+}
+function scanRow(m, last = referenceLast(m)?.price) {
+  const s = m.state;
+  const t = s.marketClock || Date.now();
+  const w5 = flowWindow(m, 5 * 6e4);
+  const sigma = sigmaFromVwapOf(m);
+  const bars = s.flowBars;
+  let volumeZ = null;
+  if (bars.length > 120) {
+    const minutes = /* @__PURE__ */ new Map();
+    for (const b of bars) minutes.set(Math.floor(b.time / 6e4), (minutes.get(Math.floor(b.time / 6e4)) ?? 0) + b.volume);
+    const vols = [...minutes.values()];
+    const lastVolume = vols[vols.length - 2];
+    const base = vols.slice(Math.max(0, vols.length - 22), -2);
+    if (base.length >= 3 && lastVolume !== void 0) {
+      const mean = base.reduce((a, b) => a + b, 0) / base.length;
+      const sd = Math.sqrt(base.reduce((a, b) => a + (b - mean) ** 2, 0) / (base.length - 1));
+      volumeZ = sd > 0 ? (lastVolume - mean) / sd : 0;
+    }
+  }
+  const oi5 = oiWindowChange(s.oiHistory, 5 * 6e4);
+  const liq = summarizeLiquidations(s.liquidations, t - 5 * 6e4);
+  return {
+    symbol: m.spec.symbol,
+    ready: m.ready,
+    stream_age_s: Math.round(m.ageMs / 1e3),
+    last: sig(last, 8),
+    change_5m_pct: w5?.price_change_pct ?? null,
+    delta_5m: w5?.delta ?? null,
+    buy_pct_5m: w5?.buy_pct ?? null,
+    notional_5m_usd: w5 ? Math.round(w5.notional_raw) : null,
+    volume_z_1m: fixed(volumeZ, 2),
+    sigma_from_vwap: fixed(sigma, 2),
+    obi: m.ready ? fixed(s.currentOBI, 2) : null,
+    funding_8h_pct: pct(s.derivatives?.fundingRate8h ?? null, 4),
+    oi_change_5m_pct: oi5 ? pct(oi5.oiChange) : null,
+    oi_regime_5m: oi5?.regime ?? null,
+    liquidations_5m_usd: Math.round(liq.longNotional + liq.shortNotional),
+    big_prints_5m: s.bigTrades.filter((b) => b.timestamp >= t - 5 * 6e4).length,
+    live_venues: m.connections().filter((c) => c.status === "live").length + "/" + m.spec.venues.length
+  };
+}
 var pct;
 var init_views = __esm({
   "src/views.ts"() {
@@ -4961,6 +5006,72 @@ var init_views = __esm({
     init_derivatives();
     init_venues();
     pct = (x, decimals = 3) => fixed(x === null || x === void 0 ? null : x * 100, decimals);
+  }
+});
+
+// src/alerts.ts
+function hasCondition(c) {
+  return c.price_above !== void 0 || c.price_below !== void 0 || c.move_pct !== void 0 || !!c.liquidation_cascade || c.liquidations_usd !== void 0 || c.big_trade_usd !== void 0 || !!c.absorption || !!c.iceberg;
+}
+function checkConditions(market, c, since) {
+  const s = market.state;
+  const now2 = s.marketClock || Date.now();
+  const at = iso(now2);
+  const price = referenceLast(market, s.recentTrades)?.price ?? null;
+  if (price !== null && c.price_above !== void 0 && price >= c.price_above) {
+    return { condition: "price_above", detail: `Price ${sig(price, 8)} is at or above ${c.price_above}.`, time: at };
+  }
+  if (price !== null && c.price_below !== void 0 && price <= c.price_below) {
+    return { condition: "price_below", detail: `Price ${sig(price, 8)} is at or below ${c.price_below}.`, time: at };
+  }
+  if (c.move_pct !== void 0) {
+    const minutes = c.move_minutes ?? 5;
+    const w = flowWindow(market, minutes * 6e4);
+    if (w?.price_change_pct !== null && w?.price_change_pct !== void 0 && Math.abs(w.price_change_pct) >= c.move_pct) {
+      return { condition: "move_pct", detail: `Price moved ${w.price_change_pct > 0 ? "+" : ""}${w.price_change_pct}% over the last ${minutes}m (threshold \xB1${c.move_pct}%).`, time: at };
+    }
+  }
+  if (c.liquidation_cascade && cascadeNow(market)) {
+    const liq = summarizeLiquidations(s.liquidations, now2 - 6e4);
+    return {
+      condition: "liquidation_cascade",
+      detail: `Liquidation cascade: ${usd(liq.longNotional)} longs and ${usd(liq.shortNotional)} shorts liquidated in the last minute, at least 5\xD7 a typical minute over the last 30m.`,
+      time: at
+    };
+  }
+  if (c.liquidations_usd !== void 0) {
+    const minutes = c.liquidations_minutes ?? 5;
+    const liq = summarizeLiquidations(s.liquidations, now2 - minutes * 6e4);
+    const total = liq.longNotional + liq.shortNotional;
+    if (total >= c.liquidations_usd) {
+      return { condition: "liquidations_usd", detail: `${usd(total)} liquidated in ${minutes}m (longs ${usd(liq.longNotional)}, shorts ${usd(liq.shortNotional)}).`, time: at };
+    }
+  }
+  if (c.big_trade_usd !== void 0) {
+    for (const t of s.recentTrades) {
+      if (t.timestamp <= since) break;
+      if (t.quoteVolume >= c.big_trade_usd) {
+        return { condition: "big_trade_usd", detail: `${t.side === "buy" ? "Buy" : "Sell"} print of ${usd(t.quoteVolume)} at ${sig(t.price, 8)} on ${t.venue}.`, time: iso(t.timestamp) };
+      }
+    }
+  }
+  if (c.absorption || c.iceberg) {
+    for (let i = s.microEvents.length - 1; i >= 0; i--) {
+      const e = s.microEvents[i];
+      if (e.time <= since) break;
+      if (e.kind === "absorption" && c.absorption || e.kind === "iceberg" && c.iceberg) {
+        const what = e.kind === "absorption" ? e.side === "bid" ? "Bids absorbed aggressive selling" : "Offers absorbed aggressive buying" : e.side === "bid" ? "Iceberg bid refilled" : "Iceberg offer refilled";
+        return { condition: e.kind, detail: `${what} at ${sig(e.price, 8)} (${usd(e.notional)}, ratio ${fixed(e.ratio, 1)}).`, time: iso(e.time) };
+      }
+    }
+  }
+  return null;
+}
+var init_alerts = __esm({
+  "src/alerts.ts"() {
+    "use strict";
+    init_derivatives();
+    init_views();
   }
 });
 
@@ -4979,7 +5090,7 @@ function json(value) {
 function fail(message) {
   return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
 }
-function createServer(hub2) {
+function createServer(hub2, extras2 = {}) {
   const server = new McpServer({ name: "order-flow-mcp", version: VERSION }, { instructions: INSTRUCTIONS });
   async function withMarket(args, fn) {
     try {
@@ -5169,48 +5280,7 @@ function createServer(hub2) {
       }
     }
     await Promise.all(markets.map((m) => m.ready && m.settled ? true : m.waitReady(Math.max(1e3, (args.wait_seconds ?? 10) * 1e3 - m.ageMs))));
-    const rows = markets.map((m) => {
-      const s = m.state;
-      const t = s.marketClock || Date.now();
-      const w5 = flowWindow(m, 5 * 6e4);
-      const session = s.session;
-      const sigma = sigmaFromVwapOf(m);
-      const bars = s.flowBars;
-      let volumeZ = null;
-      if (bars.length > 120) {
-        const minutes = /* @__PURE__ */ new Map();
-        for (const b of bars) minutes.set(Math.floor(b.time / 6e4), (minutes.get(Math.floor(b.time / 6e4)) ?? 0) + b.volume);
-        const vols = [...minutes.values()];
-        const last = vols[vols.length - 2];
-        const base = vols.slice(Math.max(0, vols.length - 22), -2);
-        if (base.length >= 3 && last !== void 0) {
-          const mean = base.reduce((a, b) => a + b, 0) / base.length;
-          const sd = Math.sqrt(base.reduce((a, b) => a + (b - mean) ** 2, 0) / (base.length - 1));
-          volumeZ = sd > 0 ? (last - mean) / sd : 0;
-        }
-      }
-      const oi5 = oiWindowChange(s.oiHistory, 5 * 6e4);
-      const liq = summarizeLiquidations(s.liquidations, t - 5 * 6e4);
-      return {
-        symbol: m.spec.symbol,
-        ready: m.ready,
-        stream_age_s: Math.round(m.ageMs / 1e3),
-        last: sig(referenceLast(m)?.price, 8),
-        change_5m_pct: w5?.price_change_pct ?? null,
-        delta_5m: w5?.delta ?? null,
-        buy_pct_5m: w5?.buy_pct ?? null,
-        notional_5m_usd: w5 ? Math.round(w5.notional_raw) : null,
-        volume_z_1m: fixed(volumeZ, 2),
-        sigma_from_vwap: fixed(sigma, 2),
-        obi: m.ready ? fixed(s.currentOBI, 2) : null,
-        funding_8h_pct: pct(s.derivatives?.fundingRate8h ?? null, 4),
-        oi_change_5m_pct: oi5 ? pct(oi5.oiChange) : null,
-        oi_regime_5m: oi5?.regime ?? null,
-        liquidations_5m_usd: Math.round(liq.longNotional + liq.shortNotional),
-        big_prints_5m: s.bigTrades.filter((b) => b.timestamp >= t - 5 * 6e4).length,
-        live_venues: m.connections().filter((c) => c.status === "live").length + "/" + m.spec.venues.length
-      };
-    });
+    const rows = markets.map((m) => scanRow(m));
     const key2 = {
       volume_z: "volume_z_1m",
       delta_5m: "delta_5m",
@@ -5292,6 +5362,140 @@ function createServer(hub2) {
       connections: connectionsView(m)
     }))
   }));
+  server.registerTool("open_screener", {
+    title: "Open the live screener",
+    description: "Open a live screener page for the user: a watchlist of every streaming market whose prices, sparklines and order-flow stats (delta, buy %, book imbalance, funding, OI, liquidations, cascade alerts, big prints) update several times a second, plus a live tape of notable events. Pass symbols to add them to the watchlist first. Returns the page URL; on a local server it also opens it in the browser.",
+    inputSchema: {
+      symbols: z.array(z.string()).max(20).optional().describe('Markets to add and pin first, e.g. ["BTC", "ETH", "SOL"]. Markets already streaming are shown either way.'),
+      venue: venueArg,
+      market_type: marketTypeArg,
+      open_browser: z.boolean().optional().describe("Open the page in the default browser of the machine running this server (default true). Set false when the server is remote.")
+    },
+    annotations: { readOnlyHint: false, openWorldHint: true }
+  }, async ({ symbols, venue, market_type, open_browser }) => {
+    if (!extras2.screener) return fail("The live screener is not available on this server.");
+    const added = [];
+    for (const symbol of symbols ?? []) {
+      try {
+        const { market } = hub2.open(symbol, venue, market_type);
+        market.pinned = true;
+        added.push({ symbol: market.spec.symbol, key: market.spec.key });
+      } catch (error) {
+        added.push({ symbol, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    try {
+      const url = await extras2.screener();
+      const opened = open_browser !== false && !!extras2.openBrowser?.(url);
+      return json({
+        url,
+        opened_in_browser: opened,
+        ...added.length ? { added } : {},
+        markets_on_screen: hub2.list().map((m) => m.spec.key),
+        note: opened ? "The screener is open in the user's browser and updates live. Tell the user the URL in case it opened behind other windows." : "Give the user this URL to open; the page updates live. It is served by this MCP server, so it works only while the server runs and from a machine that can reach it."
+      });
+    } catch (error) {
+      return fail(`Could not start the screener: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+  server.registerTool("wait_for", {
+    title: "Wait for a market event",
+    description: "Block until a condition fires on any of the given markets, or until the timeout, instead of polling. Returns which condition fired, on which market, and that market's screener row. Conditions on price level, move %, liquidation cascade and liquidation total fire immediately if already true (check waited_s); big_trade_usd, absorption and iceberg need a new event after the call starts. To keep watching, call again after it returns.",
+    inputSchema: {
+      symbols: z.array(z.string()).min(1).max(10).describe('Markets to watch, e.g. ["BTC"] or ["BTC", "ETH", "SOL"].'),
+      venue: venueArg,
+      market_type: marketTypeArg,
+      price_above: z.number().optional().describe("Fire when the price is at or above this level (use with a single symbol)."),
+      price_below: z.number().optional().describe("Fire when the price is at or below this level (use with a single symbol)."),
+      move_pct: z.number().positive().optional().describe("Fire when the price has moved at least this % (either direction) over move_minutes."),
+      move_minutes: z.number().min(1).max(120).optional().describe("Window for move_pct (default 5)."),
+      liquidation_cascade: z.boolean().optional().describe("Fire on a liquidation cascade: the last minute's liquidations are \u2265 $100K and at least 5\xD7 a typical (median) minute over the last 30m (perps)."),
+      liquidations_usd: z.number().positive().optional().describe("Fire when liquidations over liquidations_minutes reach this many USD (perps)."),
+      liquidations_minutes: z.number().min(1).max(60).optional().describe("Window for liquidations_usd (default 5)."),
+      big_trade_usd: z.number().positive().optional().describe("Fire on a single print of at least this many USD."),
+      absorption: z.boolean().optional().describe("Fire on a new absorption event."),
+      iceberg: z.boolean().optional().describe("Fire on a new iceberg event."),
+      timeout_seconds: z.number().min(1).max(3600).optional().describe("Give up after this long (default 300). Clients may cut very long calls; on timed_out just call again.")
+    },
+    annotations: readOnly
+  }, async (args, extra) => {
+    const conditions = {
+      price_above: args.price_above,
+      price_below: args.price_below,
+      move_pct: args.move_pct,
+      move_minutes: args.move_minutes,
+      liquidation_cascade: args.liquidation_cascade,
+      liquidations_usd: args.liquidations_usd,
+      liquidations_minutes: args.liquidations_minutes,
+      big_trade_usd: args.big_trade_usd,
+      absorption: args.absorption,
+      iceberg: args.iceberg
+    };
+    if (!hasCondition(conditions)) return fail("Give at least one condition, e.g. liquidation_cascade: true or price_above: 100000.");
+    const markets = [];
+    const wasPinned = /* @__PURE__ */ new Map();
+    const errors = {};
+    for (const symbol of args.symbols) {
+      try {
+        const { market } = hub2.open(symbol, args.venue, args.market_type);
+        if (!wasPinned.has(market)) wasPinned.set(market, market.pinned);
+        market.pinned = true;
+        markets.push(market);
+      } catch (error) {
+        errors[symbol] = error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (!markets.length) return fail(Object.entries(errors).map(([k, v]) => `${k}: ${v}`).join("; "));
+    await Promise.all(markets.map((m) => m.ready ? true : m.waitReady(1e4)));
+    const started = Date.now();
+    const timeoutMs = (args.timeout_seconds ?? 300) * 1e3;
+    const since = new Map(markets.map((m) => [m, m.state.marketClock || Date.now()]));
+    const progressToken = extra._meta?.progressToken;
+    let nextProgress = started + 15e3;
+    let hit = null;
+    while (!extra.signal.aborted) {
+      for (const m of markets) {
+        const h = checkConditions(m.touch(), conditions, since.get(m));
+        if (h) {
+          hit = { market: m, hit: h };
+          break;
+        }
+      }
+      if (hit || Date.now() - started >= timeoutMs) break;
+      if (progressToken !== void 0 && Date.now() >= nextProgress) {
+        nextProgress += 15e3;
+        await extra.sendNotification({
+          method: "notifications/progress",
+          params: { progressToken, progress: Date.now() - started, total: timeoutMs, message: "Watching " + markets.map((m) => m.spec.symbol).join(", ") }
+        }).catch(() => {
+        });
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    for (const [m, pinned] of wasPinned) m.pinned = pinned;
+    const waited = fixed((Date.now() - started) / 1e3, 1);
+    if (hit) {
+      return json({
+        triggered: true,
+        market: hit.market.spec.key,
+        symbol: hit.market.spec.symbol,
+        condition: hit.hit.condition,
+        detail: hit.hit.detail,
+        event_time: hit.hit.time,
+        waited_s: waited,
+        row: scanRow(hit.market),
+        ...Object.keys(errors).length ? { errors } : {}
+      });
+    }
+    return json({
+      triggered: false,
+      reason: extra.signal.aborted ? "cancelled" : "timed_out",
+      waited_s: waited,
+      rows: markets.map((m) => scanRow(m)),
+      ...Object.keys(errors).length ? { errors } : {},
+      note: "Nothing fired. Call wait_for again to keep watching."
+    });
+  });
   server.registerPrompt("analyze_order_flow", {
     title: "Analyze order flow",
     description: "Read the live order flow for a market and summarize who is in control, key levels and risks.",
@@ -5312,7 +5516,7 @@ var init_server = __esm({
   "src/server.ts"() {
     "use strict";
     init_instruments();
-    init_derivatives();
+    init_alerts();
     init_resolve();
     init_views();
     VERSION = "0.1.0";
@@ -5322,6 +5526,8 @@ How to use:
 - Start with get_market_snapshot for a symbol (e.g. "BTC", "ETH", "SOL"). It returns price, session VWAP, delta, CVD windows, volume profile levels, order-book imbalance, open interest, funding, liquidations, big prints, absorption/iceberg events and plain-language signals.
 - Drill down with get_footprint, get_volume_profile, get_order_book, get_flow_series (CVD / volume z-score), get_derivatives, get_liquidations, get_big_trades, get_trades, get_microstructure_events, get_venue_comparison and get_liquidity_heatmap.
 - Use scan_markets to screen several symbols at once.
+- To watch for something (a liquidation cascade, a price level, a big print, a sharp move), call wait_for: it blocks until the condition fires or times out, so you react within a fraction of a second without polling. Call it again to keep watching.
+- When the user wants to see the market live, call open_screener: it opens a page that updates several times a second with prices, sparklines and order-flow stats for every streaming market.
 - Defaults: market_type="perp" and venue="all" (every venue listing the market, aggregated). Pass venue="bybit" etc. for one exchange, market_type="spot" for spot.
 
 Important: data is live and in-memory, and streams continuously while the server runs. The server's watchlist (BTC, ETH and SOL perpetuals by default) streams from startup; any other market starts streaming the first time it is requested and then keeps streaming. Session statistics cover only the time since a market began streaming (see stream_age_s; warming_up=true for the first minute), so wait before drawing conclusions from a young stream. list_active_markets shows what is streaming and for how long; watch_markets pins more markets. This is market data for analysis only; it cannot place orders.`;
@@ -5330,6 +5536,663 @@ Important: data is live and in-memory, and streams continuously while the server
     marketTypeArg = z.enum(["perp", "perpetual", "spot"]).optional().describe('"perp" (default) or "spot".');
     waitArg = z.number().min(0).max(30).optional().describe("Seconds to wait for first data when a market is not streaming yet (default 10).");
     marketArgs = { symbol: symbolArg, venue: venueArg, market_type: marketTypeArg, wait_seconds: waitArg };
+  }
+});
+
+// src/screener-page.ts
+var SCREENER_PAGE;
+var init_screener_page = __esm({
+  "src/screener-page.ts"() {
+    "use strict";
+    SCREENER_PAGE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Order Flow Screener</title>
+<style>
+:root {
+  --bg: #000; --fg: #fff; --muted: #8e8e93; --faint: #48484a; --line: #1c1c1e; --chip: #1c1c1e;
+  --up: #30d158; --down: #ff453a; --up-pill: #34c759; --down-pill: #ff3b30; --pill-fg: #fff;
+  --flat: #636366; --warn: #ffd60a;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #fff; --fg: #000; --muted: #6c6c70; --faint: #c7c7cc; --line: #e5e5ea; --chip: #f2f2f7;
+    --up: #248a3d; --down: #d70015; --flat: #8e8e93; --warn: #b25000; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); }
+body {
+  font: 16px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums;
+  padding: 0 16px env(safe-area-inset-bottom);
+}
+main { max-width: 760px; margin: 0 auto; }
+header {
+  position: sticky; top: 0; z-index: 2; background: var(--bg);
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  padding: 20px 0 12px; border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; margin: 0; }
+.sub { color: var(--muted); font-size: 14px; margin-top: 4px; display: flex; align-items: center; gap: 6px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--up); box-shadow: 0 0 0 0 var(--up); animation: beat 2s infinite; }
+.dot.off { background: var(--flat); animation: none; }
+@keyframes beat { 0% { box-shadow: 0 0 0 0 rgba(48,209,88,.6); } 70% { box-shadow: 0 0 0 7px rgba(48,209,88,0); } 100% { box-shadow: 0 0 0 0 rgba(48,209,88,0); } }
+.seg { display: inline-flex; background: var(--chip); border-radius: 9px; padding: 2px; }
+.seg button {
+  font: inherit; font-size: 13px; font-weight: 600; color: var(--muted); background: none; border: 0;
+  padding: 6px 11px; border-radius: 7px; cursor: pointer;
+}
+.seg button[aria-pressed="true"] { background: var(--faint); color: var(--fg); }
+.row {
+  display: grid; grid-template-columns: minmax(0, 1fr) 128px minmax(108px, auto); column-gap: 16px; align-items: center;
+  padding: 14px 0 12px; border-bottom: 1px solid var(--line);
+}
+.id { min-width: 0; }
+.sym { font-size: 21px; font-weight: 700; letter-spacing: -0.01em; display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+.tag { font-size: 10px; font-weight: 700; color: var(--muted); border: 1px solid var(--faint); border-radius: 4px; padding: 1px 4px; letter-spacing: .04em; }
+.name { color: var(--muted); font-size: 15px; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.badge { font-size: 10px; font-weight: 800; letter-spacing: .05em; border-radius: 4px; padding: 2px 5px; }
+.badge.cascade { background: var(--down-pill); color: #fff; animation: blink 1s steps(2, start) infinite; }
+.badge.warm { color: var(--warn); border: 1px solid currentColor; font-weight: 700; }
+@keyframes blink { to { opacity: .45; } }
+svg.spark { width: 128px; height: 46px; display: block; overflow: visible; }
+.quote { text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
+.px { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; transition: color .5s; }
+.px .d { border-radius: 3px; transition: background-color .6s, color .6s; }
+.px.up .d { color: var(--up); background: rgba(48,209,88,.16); transition: none; }
+.px.down .d { color: var(--down); background: rgba(255,69,58,.16); transition: none; }
+.pill {
+  font: inherit; font-size: 16px; font-weight: 600; min-width: 96px; text-align: right; color: var(--pill-fg);
+  background: var(--flat); border: 0; border-radius: 7px; padding: 5px 9px; cursor: pointer; white-space: nowrap;
+}
+.pill.up { background: var(--up-pill); } .pill.down { background: var(--down-pill); }
+.flow { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chip { font-size: 12px; background: var(--chip); color: var(--muted); border-radius: 6px; padding: 3px 7px; white-space: nowrap; }
+.chip b { font-weight: 600; color: var(--fg); }
+.chip b.up { color: var(--up); } .chip b.down { color: var(--down); } .chip.hot { box-shadow: inset 0 0 0 1px var(--warn); }
+.empty { color: var(--muted); padding: 40px 0; text-align: center; line-height: 1.6; }
+.empty code { background: var(--chip); padding: 2px 6px; border-radius: 5px; color: var(--fg); }
+section.tape { margin: 26px 0 10px; }
+section.tape h2 { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 0 0 6px; }
+.ev { display: grid; grid-template-columns: 70px 52px minmax(0, 1fr) auto; gap: 10px; font-size: 14px; padding: 7px 0; border-bottom: 1px solid var(--line); align-items: baseline; }
+.ev .t { color: var(--muted); } .ev .b { font-weight: 700; } .ev .x { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev .u.up { color: var(--up); } .ev .u.down { color: var(--down); }
+.ev.new { animation: slide .5s ease-out; }
+@keyframes slide { from { background: var(--chip); } to { background: transparent; } }
+footer { color: var(--muted); font-size: 12px; padding: 18px 0 28px; line-height: 1.5; }
+@media (max-width: 480px) {
+  .row { grid-template-columns: minmax(0, 1fr) 84px minmax(96px, auto); column-gap: 10px; }
+  svg.spark { width: 84px; }
+  .sym, .px { font-size: 18px; }
+  .pill { font-size: 14px; min-width: 82px; }
+  .name { font-size: 13px; }
+  .ev { grid-template-columns: 62px 44px minmax(0, 1fr) auto; font-size: 13px; }
+  .chip.minor { display: none; }
+  .chip { font-size: 11px; }
+}
+@media (prefers-reduced-motion: reduce) { .dot, .badge.cascade, .ev.new { animation: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Order Flow</h1>
+      <div class="sub"><span class="dot off" id="dot"></span><span id="status">Connecting\u2026</span></div>
+    </div>
+    <nav class="seg" id="seg" aria-label="Change window">
+      <button data-w="15m">15m</button><button data-w="1h">1h</button><button data-w="4h">4h</button><button data-w="session">Session</button>
+    </nav>
+  </header>
+  <div id="list"></div>
+  <section class="tape" id="tapeBox" hidden>
+    <h2>Live tape</h2>
+    <div id="tape"></div>
+  </section>
+  <footer>
+    Prices are the median of each venue's latest print; change is measured from the start of the selected window
+    (or from when the market began streaming). Markets appear here as soon as your agent streams them.
+    Market data for analysis only, not financial advice.
+  </footer>
+</main>
+<script>
+(function () {
+  "use strict";
+  var params = new URLSearchParams(location.search);
+  var token = params.get("token");
+  var store = {
+    get: function (k, d) { try { return localStorage.getItem("ofs." + k) || d; } catch (e) { return d; } },
+    set: function (k, v) { try { localStorage.setItem("ofs." + k, v); } catch (e) {} }
+  };
+  var win = params.get("window") || store.get("window", "1h");
+  var pillMode = store.get("pill", "pct");
+  var rows = new Map();     // key -> { data, el, refs }
+  var seenEvents = new Set();
+  var listEl = document.getElementById("list");
+  var es = null, lastMsg = 0;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function fmtPrice(x, d) {
+    if (x === null || x === undefined) return "\u2014";
+    return x.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+  function fmtUsd(x) {
+    var a = Math.abs(x), s = x < 0 ? "-" : "";
+    if (a >= 1e9) return s + "$" + (a / 1e9).toFixed(2) + "B";
+    if (a >= 1e6) return s + "$" + (a / 1e6).toFixed(2) + "M";
+    if (a >= 1e3) return s + "$" + (a / 1e3).toFixed(0) + "K";
+    return s + "$" + a.toFixed(0);
+  }
+  function fmtNum(x) {
+    var a = Math.abs(x);
+    if (a >= 1e6) return (x / 1e6).toFixed(2) + "M";
+    if (a >= 1e3) return (x / 1e3).toFixed(1) + "K";
+    if (a >= 100) return x.toFixed(0);
+    if (a >= 1) return x.toFixed(2);
+    return x.toPrecision(2);
+  }
+  function signed(s, x) { return (x > 0 ? "+" : "") + s; }
+  function dir(x) { return x > 0 ? "up" : x < 0 ? "down" : ""; }
+
+  // \u2500\u2500\u2500 row DOM \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  function makeRow(d) {
+    var row = el("div", "row");
+    var id = el("div", "id");
+    var sym = el("div", "sym");
+    var symText = el("span", "", d.base);
+    var tag = el("span", "tag", d.market_type === "perp" ? "PERP" : "SPOT");
+    var badges = el("span");
+    sym.append(symText, tag, badges);
+    var venue = d.venue.indexOf("all-") === 0 ? "all venues" : d.venue.replace(/-(futures|spot)$/, "");
+    var name = el("div", "name", d.name + " \xB7 " + venue);
+    id.append(sym, name);
+
+    var svg = svgEl("svg", { class: "spark", viewBox: "0 0 128 46", preserveAspectRatio: "none" });
+    var gid = "g" + Math.random().toString(36).slice(2);
+    var defs = svgEl("defs", {});
+    var grad = svgEl("linearGradient", { id: gid, x1: "0", y1: "0", x2: "0", y2: "1" });
+    var s1 = svgEl("stop", { offset: "0%", "stop-opacity": "0.45" });
+    var s2 = svgEl("stop", { offset: "100%", "stop-opacity": "0" });
+    grad.append(s1, s2); defs.append(grad);
+    var base = svgEl("line", { x1: "0", x2: "128", "stroke-dasharray": "3 3", "stroke-width": "1", "vector-effect": "non-scaling-stroke", opacity: "0.8" });
+    var area = svgEl("path", { fill: "url(#" + gid + ")", stroke: "none" });
+    var line = svgEl("path", { fill: "none", "stroke-width": "1.75", "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke" });
+    svg.append(defs, area, base, line);
+
+    var quote = el("div", "quote");
+    var px = el("div", "px");
+    var pill = el("button", "pill");
+    pill.title = "Tap to switch between % and price change";
+    pill.addEventListener("click", function () {
+      pillMode = pillMode === "pct" ? "abs" : "pct";
+      store.set("pill", pillMode);
+      rows.forEach(function (r) { renderQuote(r, false); });
+    });
+    quote.append(px, pill);
+    var flow = el("div", "flow");
+    row.append(id, svg, quote, flow);
+    return { el: row, refs: { badges: badges, s1: s1, s2: s2, base: base, area: area, line: line, px: px, pill: pill, flow: flow, svg: svg }, shown: null, flashTimer: 0 };
+  }
+
+  function renderSpark(r) {
+    var d = r.data, refs = r.refs;
+    var vals = d.spark.slice();
+    if (d.last !== null && vals.length) vals[vals.length - 1] = d.last;
+    var pts = [];
+    var lo = Infinity, hi = -Infinity;
+    for (var i = 0; i < vals.length; i++) if (vals[i] !== null) { lo = Math.min(lo, vals[i]); hi = Math.max(hi, vals[i]); }
+    if (!isFinite(lo)) { refs.line.setAttribute("d", ""); refs.area.setAttribute("d", ""); refs.base.setAttribute("opacity", "0"); return; }
+    if (d.baseline !== null) { lo = Math.min(lo, d.baseline); hi = Math.max(hi, d.baseline); }
+    var pad = (hi - lo) * 0.08 || Math.abs(hi) * 0.0005 || 1;
+    lo -= pad; hi += pad;
+    var W = 128, H = 46, n = vals.length;
+    function y(v) { return (H - ((v - lo) / (hi - lo)) * H).toFixed(2); }
+    for (var j = 0; j < n; j++) if (vals[j] !== null) pts.push([(n > 1 ? (j / (n - 1)) * W : W).toFixed(2), y(vals[j])]);
+    var lineD = "M" + pts.map(function (p) { return p[0] + " " + p[1]; }).join(" L");
+    refs.line.setAttribute("d", lineD);
+    refs.area.setAttribute("d", lineD + " L" + pts[pts.length - 1][0] + " " + H + " L" + pts[0][0] + " " + H + " Z");
+    var up = d.change === null || d.change >= 0;
+    var c = getComputedStyle(document.documentElement).getPropertyValue(up ? "--up" : "--down");
+    refs.line.setAttribute("stroke", c);
+    refs.s1.setAttribute("stop-color", c); refs.s2.setAttribute("stop-color", c);
+    refs.base.setAttribute("stroke", c);
+    if (d.baseline !== null) { var by = y(d.baseline); refs.base.setAttribute("y1", by); refs.base.setAttribute("y2", by); refs.base.setAttribute("opacity", "0.8"); }
+  }
+
+  function renderQuote(r, flash) {
+    var d = r.data, refs = r.refs;
+    var text = fmtPrice(d.last, d.decimals);
+    var prev = r.shown;
+    refs.px.textContent = "";
+    if (flash && prev && prev !== text && prev.length === text.length) {
+      var k = 0;
+      while (k < text.length && text[k] === prev[k]) k++;
+      refs.px.append(document.createTextNode(text.slice(0, k)), el("span", "d", text.slice(k)));
+      var moved = d.last - r.prevPrice;
+      refs.px.classList.remove("up", "down");
+      void refs.px.offsetWidth;
+      refs.px.classList.add(moved >= 0 ? "up" : "down");
+      clearTimeout(r.flashTimer);
+      r.flashTimer = setTimeout(function () { refs.px.classList.remove("up", "down"); }, 450);
+    } else {
+      refs.px.append(el("span", "d", text));
+    }
+    r.shown = text;
+    r.prevPrice = d.last;
+    var ch = d.change;
+    refs.pill.className = "pill " + (ch === null ? "" : dir(ch));
+    if (ch === null) refs.pill.textContent = "\u2014";
+    else if (pillMode === "pct") refs.pill.textContent = signed(d.change_pct.toFixed(2) + "%", d.change_pct);
+    else refs.pill.textContent = signed(fmtPrice(ch, d.decimals), ch);
+  }
+
+  function chip(label, value, cls, hot, minor) {
+    var c = el("span", "chip" + (hot ? " hot" : "") + (minor ? " minor" : ""));
+    c.append(document.createTextNode(label + " "), el("b", cls || "", value));
+    return c;
+  }
+
+  function renderFlow(r) {
+    var d = r.data, refs = r.refs;
+    var chips = [];
+    if (d.delta_5m !== null) chips.push(chip("\u0394 5m", signed(fmtNum(d.delta_5m), d.delta_5m), dir(d.delta_5m)));
+    if (d.buy_pct_5m !== null) chips.push(chip("Buy", d.buy_pct_5m.toFixed(0) + "%", d.buy_pct_5m >= 55 ? "up" : d.buy_pct_5m <= 45 ? "down" : ""));
+    if (d.notional_5m_usd !== null) chips.push(chip("Vol 5m", fmtUsd(d.notional_5m_usd), "", false, true));
+    if (d.volume_z_1m !== null) chips.push(chip("Vol z", d.volume_z_1m.toFixed(1), "", Math.abs(d.volume_z_1m) >= 3, Math.abs(d.volume_z_1m) < 3));
+    if (d.obi !== null) chips.push(chip("Book", signed(d.obi.toFixed(2), d.obi), dir(d.obi)));
+    if (d.sigma_from_vwap !== null) chips.push(chip("VWAP", signed(d.sigma_from_vwap.toFixed(1) + "\u03C3", d.sigma_from_vwap), "", Math.abs(d.sigma_from_vwap) >= 2, Math.abs(d.sigma_from_vwap) < 2));
+    if (d.funding_8h_pct !== null) chips.push(chip("Fund 8h", d.funding_8h_pct.toFixed(4) + "%", dir(d.funding_8h_pct)));
+    if (d.oi_change_5m_pct !== null) chips.push(chip("OI 5m", signed(d.oi_change_5m_pct.toFixed(2) + "%", d.oi_change_5m_pct), dir(d.oi_change_5m_pct)));
+    if (d.market_type === "perp") {
+      var liq = d.liq_long_5m_usd + d.liq_short_5m_usd;
+      chips.push(chip("Liq 5m", liq ? "L " + fmtUsd(d.liq_long_5m_usd) + " \xB7 S " + fmtUsd(d.liq_short_5m_usd) : "$0", "", d.cascade));
+    }
+    if (d.big_prints_5m) chips.push(chip("Big prints", String(d.big_prints_5m), "", false, true));
+    chips.push(chip("Live", d.live_venues, "", false, true));
+    refs.flow.replaceChildren.apply(refs.flow, chips);
+
+    var badges = [];
+    if (d.cascade) badges.push(el("span", "badge cascade", "LIQ CASCADE"));
+    if (!d.ready || d.stream_age_s < 60) badges.push(el("span", "badge warm", d.ready ? "WARMING UP" : "CONNECTING"));
+    refs.badges.replaceChildren.apply(refs.badges, badges);
+  }
+
+  // \u2500\u2500\u2500 stream handling \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  function onFull(msg) {
+    var keys = new Set();
+    msg.rows.forEach(function (d) {
+      keys.add(d.key);
+      var r = rows.get(d.key);
+      if (!r) { r = makeRow(d); rows.set(d.key, r); }
+      var flash = r.data && r.data.last !== d.last;
+      r.data = d;
+      renderQuote(r, flash);
+      renderSpark(r);
+      renderFlow(r);
+    });
+    rows.forEach(function (r, key) { if (!keys.has(key)) { r.el.remove(); rows.delete(key); } });
+    // Keep DOM order equal to server order.
+    var order = msg.rows.map(function (d) { return rows.get(d.key).el; });
+    var same = order.length === listEl.children.length && order.every(function (e, i) { return listEl.children[i] === e; });
+    if (!same) listEl.replaceChildren.apply(listEl, order);
+    if (!msg.rows.length) {
+      var empty = el("div", "empty");
+      empty.append(document.createTextNode("No markets are streaming yet. Ask your agent to "), el("code", "", "watch_markets"), document.createTextNode(" or "), el("code", "", "open_screener"), document.createTextNode(" with some symbols."));
+      listEl.replaceChildren(empty);
+    }
+    renderTape(msg.events || []);
+    setStatus(true, msg.rows.length);
+  }
+
+  function onTick(msg) {
+    for (var key in msg.p) {
+      var r = rows.get(key);
+      if (!r) continue;
+      var d = r.data, p = msg.p[key];
+      d.last = p;
+      if (d.baseline !== null) { d.change = p - d.baseline; d.change_pct = d.baseline ? ((p - d.baseline) / d.baseline) * 100 : 0; }
+      renderQuote(r, true);
+      renderSpark(r);
+    }
+    lastMsg = Date.now();
+  }
+
+  function renderTape(events) {
+    var box = document.getElementById("tapeBox"), tape = document.getElementById("tape");
+    box.hidden = !events.length;
+    var nodes = events.map(function (e) {
+      var id = e.time + e.base + e.kind + e.usd;
+      var row = el("div", "ev" + (seenEvents.size && !seenEvents.has(id) ? " new" : ""));
+      var t = new Date(e.time);
+      row.append(
+        el("span", "t", t.toLocaleTimeString([], { hour12: false })),
+        el("span", "b", e.base),
+        el("span", "x", e.text),
+        el("span", "u " + (e.side === "buy" ? "up" : "down"), fmtUsd(e.usd))
+      );
+      return { id: id, node: row };
+    });
+    nodes.forEach(function (n) { seenEvents.add(n.id); });
+    if (seenEvents.size > 2000) seenEvents = new Set(nodes.map(function (n) { return n.id; }));
+    tape.replaceChildren.apply(tape, nodes.map(function (n) { return n.node; }));
+  }
+
+  function setStatus(live, count) {
+    lastMsg = Date.now();
+    document.getElementById("dot").className = "dot" + (live ? "" : " off");
+    document.getElementById("status").textContent = live
+      ? "Live \xB7 " + count + (count === 1 ? " market" : " markets") + " \xB7 " + new Date().toLocaleTimeString([], { hour12: false })
+      : "Reconnecting\u2026";
+  }
+
+  function connect() {
+    if (es) es.close();
+    var q = "window=" + encodeURIComponent(win) + (token ? "&token=" + encodeURIComponent(token) : "");
+    es = new EventSource("/screener/stream?" + q);
+    es.addEventListener("full", function (ev) { onFull(JSON.parse(ev.data)); });
+    es.addEventListener("tick", function (ev) { onTick(JSON.parse(ev.data)); });
+    es.onerror = function () { setStatus(false, 0); };
+  }
+  setInterval(function () { if (Date.now() - lastMsg > 5000) setStatus(false, 0); }, 2000);
+
+  var seg = document.getElementById("seg");
+  function markSeg() {
+    Array.prototype.forEach.call(seg.children, function (b) { b.setAttribute("aria-pressed", String(b.dataset.w === win)); });
+  }
+  seg.addEventListener("click", function (ev) {
+    var w = ev.target && ev.target.dataset && ev.target.dataset.w;
+    if (!w || w === win) return;
+    win = w; store.set("window", w); markSeg(); connect();
+  });
+  markSeg();
+  connect();
+})();
+</script>
+</body>
+</html>
+`;
+  }
+});
+
+// src/screener.ts
+var screener_exports = {};
+__export(screener_exports, {
+  SCREENER_WINDOWS: () => SCREENER_WINDOWS,
+  ScreenerService: () => ScreenerService,
+  listenScreener: () => listenScreener,
+  openInBrowser: () => openInBrowser,
+  screenerEvents: () => screenerEvents,
+  screenerRow: () => screenerRow,
+  screenerSnapshot: () => screenerSnapshot,
+  screenerUrl: () => screenerUrl,
+  sparkline: () => sparkline
+});
+import { createServer as createServer2 } from "http";
+import { spawn } from "child_process";
+function livePrice(market) {
+  return referenceLast(market, market.state.recentTrades)?.price ?? null;
+}
+function sparkline(market, windowMs, points = SPARK_POINTS) {
+  const s = market.state;
+  const end = s.marketClock || Date.now();
+  const span = windowMs > 0 ? windowMs : Math.max(6e4, end - market.startedAt);
+  const start = end - span;
+  const bars = s.liveBar ? [...s.flowBars, s.liveBar] : s.flowBars;
+  const candles = market.baseCandles();
+  const useBars = bars.length > 0 && (bars[0].time <= start + 1e3 || !candles.length || candles[0].openTime >= bars[0].time - 6e4);
+  const series = useBars ? bars.filter((b) => b.time >= start && b.trades > 0) : candles.filter((c) => c.closeTime >= start).map((c) => ({ time: c.openTime, open: c.open, close: c.close }));
+  if (!series.length) return null;
+  const step = span / points;
+  const values = [];
+  let i = 0;
+  let last = null;
+  for (let k = 0; k < points; k++) {
+    const bucketEnd = start + (k + 1) * step;
+    while (i < series.length && series[i].time < bucketEnd) last = series[i++].close;
+    values.push(last);
+  }
+  return { base: series[0].open, values };
+}
+function screenerRow(market, windowMs) {
+  const s = market.state;
+  const last = livePrice(market);
+  const spark = sparkline(market, windowMs);
+  const scan = scanRow(market, last ?? void 0);
+  const t = s.marketClock || Date.now();
+  const liq = summarizeLiquidations(s.liquidations, t - 5 * 6e4);
+  const base = market.spec.symbol.replace(/USDT$/, "");
+  const asset = assetFor(market.spec.symbol);
+  const decimals = Math.min(8, getTickDecimals(market.manager.tickSize || 0.01));
+  const baseline = spark?.base ?? null;
+  return {
+    key: market.spec.key,
+    base,
+    name: asset?.name ?? base,
+    color: asset?.color ?? "#888",
+    market_type: market.spec.marketType === "perpetual" ? "perp" : "spot",
+    venue: market.spec.selection,
+    decimals,
+    ready: market.ready,
+    stream_age_s: scan.stream_age_s,
+    last: sig(last, 10),
+    baseline: sig(baseline, 10),
+    change: last !== null && baseline !== null ? last - baseline : null,
+    change_pct: last !== null && baseline ? fixed((last - baseline) / baseline * 100, 3) : null,
+    spark: spark?.values.map((v) => v === null ? null : sig(v, 10)) ?? [],
+    delta_5m: scan.delta_5m,
+    buy_pct_5m: scan.buy_pct_5m,
+    notional_5m_usd: scan.notional_5m_usd,
+    volume_z_1m: scan.volume_z_1m,
+    sigma_from_vwap: scan.sigma_from_vwap,
+    obi: scan.obi,
+    funding_8h_pct: scan.funding_8h_pct,
+    oi_change_5m_pct: scan.oi_change_5m_pct,
+    liq_long_5m_usd: Math.round(liq.longNotional),
+    liq_short_5m_usd: Math.round(liq.shortNotional),
+    cascade: cascadeNow(market),
+    big_prints_5m: scan.big_prints_5m,
+    live_venues: scan.live_venues
+  };
+}
+function screenerEvents(markets, limit = 14, windowMs = 15 * 6e4) {
+  const out = [];
+  for (const m of markets) {
+    const s = m.state;
+    const since = (s.marketClock || Date.now()) - windowMs;
+    const base = m.spec.symbol.replace(/USDT$/, "");
+    for (const b of s.bigTrades.slice(-20)) {
+      if (b.timestamp >= since && b.quoteVolume >= 5e4) out.push({ time: b.timestamp, base, kind: "big", side: b.side, text: `${b.side === "buy" ? "Buy" : "Sell"} print ${fixed(b.ratio, 0)}\xD7 avg`, usd: b.quoteVolume });
+    }
+    for (const e of s.microEvents.slice(-10)) {
+      if (e.time >= since) out.push({ time: e.time, base, kind: e.kind, side: e.side === "bid" ? "buy" : "sell", text: e.kind === "absorption" ? e.side === "bid" ? "Bids absorbing sellers" : "Offers absorbing buyers" : e.side === "bid" ? "Iceberg bid" : "Iceberg offer", usd: e.notional });
+    }
+    for (const l of s.liquidations.slice(-50)) {
+      if (l.timestamp >= since && l.quoteVolume >= 1e5) out.push({ time: l.timestamp, base, kind: "liq", side: l.side === "long" ? "sell" : "buy", text: `${l.side === "long" ? "Long" : "Short"} liquidated`, usd: l.quoteVolume });
+    }
+  }
+  return out.sort((a, b) => b.time - a.time).slice(0, limit);
+}
+function screenerSnapshot(hub2, window) {
+  const markets = hub2.list();
+  return {
+    as_of: Date.now(),
+    window,
+    rows: markets.map((m) => screenerRow(m, SCREENER_WINDOWS[window])),
+    events: screenerEvents(markets)
+  };
+}
+function listenScreener(service, host, port) {
+  return new Promise((resolve, reject) => {
+    let attempt = 0;
+    const tryPort = () => {
+      const server = createServer2((req, res) => {
+        if (!service.handle(req, res)) {
+          res.writeHead(302, { location: "/screener" }).end();
+        }
+      });
+      server.once("error", (error) => {
+        if (error.code === "EADDRINUSE" && attempt < 9) {
+          attempt++;
+          tryPort();
+        } else reject(error);
+      });
+      server.listen(port === 0 ? 0 : port + attempt, host, () => {
+        server.unref();
+        const bound = server.address();
+        resolve({ url: screenerUrl(host, typeof bound === "object" && bound ? bound.port : port + attempt), server });
+      });
+    };
+    tryPort();
+  });
+}
+function screenerUrl(host, port, token) {
+  const shown = host === "0.0.0.0" || host === "::" ? "localhost" : host.includes(":") ? `[${host}]` : host;
+  return `http://${shown}:${port}/screener${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+}
+function openInBrowser(url) {
+  if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return false;
+  try {
+    const [cmd, args] = process.platform === "darwin" ? ["open", [url]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] : ["xdg-open", [url]];
+    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+    child.on("error", () => {
+    });
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+var SCREENER_WINDOWS, TICK_MS, FULL_MS, SPARK_POINTS, ScreenerService;
+var init_screener = __esm({
+  "src/screener.ts"() {
+    "use strict";
+    init_instruments();
+    init_orderFlowEngine();
+    init_derivatives();
+    init_screener_page();
+    init_views();
+    SCREENER_WINDOWS = { "15m": 15 * 6e4, "1h": 60 * 6e4, "4h": 4 * 60 * 6e4, session: 0 };
+    TICK_MS = 250;
+    FULL_MS = 1e3;
+    SPARK_POINTS = 90;
+    ScreenerService = class {
+      constructor(hub2, token) {
+        this.hub = hub2;
+        this.token = token;
+      }
+      hub;
+      token;
+      clients = /* @__PURE__ */ new Set();
+      tickTimer = null;
+      fullTimer = null;
+      /** Handles /screener, /screener/stream and /screener/data.json; returns false for other paths. */
+      handle(req, res) {
+        const url = new URL(req.url ?? "/", "http://localhost");
+        const path = url.pathname.replace(/\/+$/, "") || "/";
+        if (path !== "/screener" && !path.startsWith("/screener/")) return false;
+        if (this.token && url.searchParams.get("token") !== this.token && req.headers.authorization !== `Bearer ${this.token}`) {
+          res.writeHead(401, { "content-type": "text/plain" }).end("unauthorized: open the screener link with ?token=<token>");
+          return true;
+        }
+        if (req.method !== "GET") {
+          res.writeHead(405, { "content-type": "text/plain" }).end("GET only");
+          return true;
+        }
+        const window = url.searchParams.get("window") ?? "1h";
+        const win = window in SCREENER_WINDOWS ? window : "1h";
+        if (path === "/screener") {
+          res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(SCREENER_PAGE);
+        } else if (path === "/screener/data.json") {
+          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }).end(JSON.stringify(screenerSnapshot(this.hub, win)));
+        } else if (path === "/screener/stream") {
+          this.attach(res, win);
+        } else {
+          res.writeHead(404, { "content-type": "text/plain" }).end("not found");
+        }
+        return true;
+      }
+      attach(res, window) {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-store",
+          connection: "keep-alive",
+          "x-accel-buffering": "no"
+        });
+        res.write("retry: 2000\n\n");
+        const client = { res, window, prices: /* @__PURE__ */ new Map() };
+        this.clients.add(client);
+        res.on("close", () => {
+          this.clients.delete(client);
+          if (!this.clients.size) this.stop();
+        });
+        this.sendFull([client]);
+        this.start();
+      }
+      start() {
+        if (this.tickTimer) return;
+        this.tickTimer = setInterval(() => this.sendTicks(), TICK_MS);
+        this.fullTimer = setInterval(() => this.sendFull([...this.clients]), FULL_MS);
+        this.tickTimer.unref?.();
+        this.fullTimer.unref?.();
+      }
+      stop() {
+        if (this.tickTimer) clearInterval(this.tickTimer);
+        if (this.fullTimer) clearInterval(this.fullTimer);
+        this.tickTimer = this.fullTimer = null;
+      }
+      sendFull(clients) {
+        const byWindow = /* @__PURE__ */ new Map();
+        for (const client of clients) {
+          let payload = byWindow.get(client.window);
+          if (!payload) {
+            const snap = screenerSnapshot(this.hub, client.window);
+            for (const row of snap.rows) client.prices.set(row.key, row.last);
+            payload = `event: full
+data: ${JSON.stringify(snap)}
+
+`;
+            byWindow.set(client.window, payload);
+          }
+          client.res.write(payload);
+        }
+      }
+      sendTicks() {
+        const prices = /* @__PURE__ */ new Map();
+        for (const m of this.hub.list()) prices.set(m.spec.key, sig(livePrice(m), 10));
+        for (const client of this.clients) {
+          const changed = {};
+          let any = false;
+          for (const [key2, price] of prices) {
+            if (price !== null && client.prices.get(key2) !== price) {
+              changed[key2] = price;
+              client.prices.set(key2, price);
+              any = true;
+            }
+          }
+          if (any) client.res.write(`event: tick
+data: ${JSON.stringify({ t: Date.now(), p: changed })}
+
+`);
+        }
+      }
+      close() {
+        this.stop();
+        for (const client of this.clients) client.res.end();
+        this.clients.clear();
+      }
+    };
   }
 });
 
@@ -5342,7 +6205,8 @@ await installNetworking2();
 console.log = (...args) => console.error(...args);
 console.info = (...args) => console.error(...args);
 var { MarketHub: MarketHub2 } = await Promise.resolve().then(() => (init_market(), market_exports));
-var { createServer: createServer2, VERSION: VERSION2 } = await Promise.resolve().then(() => (init_server(), server_exports));
+var { createServer: createServer3, VERSION: VERSION2 } = await Promise.resolve().then(() => (init_server(), server_exports));
+var { ScreenerService: ScreenerService2, listenScreener: listenScreener2, openInBrowser: openInBrowser2, screenerUrl: screenerUrl2 } = await Promise.resolve().then(() => (init_screener(), screener_exports));
 var DEFAULT_WATCH = "BTC,ETH,SOL";
 function parseWatch(value) {
   if (value.trim().toLowerCase() === "none") return [];
@@ -5357,7 +6221,9 @@ function parseArgs(argv) {
     watch: parseWatch(env2.ORDERFLOW_WATCH ?? DEFAULT_WATCH),
     idleMinutes: Number(env2.ORDERFLOW_IDLE_MINUTES ?? 0),
     maxMarkets: Number(env2.ORDERFLOW_MAX_MARKETS ?? 20),
-    token: env2.ORDERFLOW_HTTP_TOKEN || void 0
+    token: env2.ORDERFLOW_HTTP_TOKEN || void 0,
+    screener: env2.ORDERFLOW_SCREENER === "1" || env2.ORDERFLOW_SCREENER === "true",
+    screenerPort: Number(env2.ORDERFLOW_SCREENER_PORT ?? 3334)
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -5370,6 +6236,8 @@ function parseArgs(argv) {
     else if (a === "--idle-minutes") o.idleMinutes = Number(next());
     else if (a === "--max-markets") o.maxMarkets = Number(next());
     else if (a === "--token") o.token = next();
+    else if (a === "--screener") o.screener = true;
+    else if (a === "--screener-port") o.screenerPort = Number(next());
     else if (a === "--version" || a === "-v") {
       console.error(VERSION2);
       process.exit(0);
@@ -5387,6 +6255,10 @@ Usage: order-flow-mcp [options]
                           env ORDERFLOW_WATCH)
   --idle-minutes <n>      Close unwatched markets after n idle minutes (default 0 = never)
   --max-markets <n>       Max concurrent markets (default 20)
+  --screener              Start the live screener page at startup (otherwise it starts on the
+                          first open_screener call; env ORDERFLOW_SCREENER=1)
+  --screener-port <n>     Screener port in stdio mode (default 3334, next free port if taken;
+                          env ORDERFLOW_SCREENER_PORT). Over --http it is served at /screener.
 `);
       process.exit(0);
     }
@@ -5403,7 +6275,23 @@ for (const symbol of options.watch) {
   }
 }
 if (options.watch.length) console.error(`[order-flow-mcp] streaming from startup: ${options.watch.join(", ")}`);
+var screener = new ScreenerService2(hub, options.token);
+var screenerStart = null;
+function ensureScreener() {
+  if (options.http) return Promise.resolve(screenerUrl2(options.host, options.port, options.token));
+  screenerStart ??= listenScreener2(screener, "127.0.0.1", options.screenerPort).then(({ url }) => {
+    console.error(`[order-flow-mcp] live screener at ${url}`);
+    return url;
+  }).catch((error) => {
+    screenerStart = null;
+    throw error;
+  });
+  return screenerStart;
+}
+var local = !options.http || ["127.0.0.1", "localhost", "::1"].includes(options.host);
+var extras = { screener: ensureScreener, ...local ? { openBrowser: openInBrowser2 } : {} };
 function shutdown() {
+  screener.close();
   hub.dispose();
   setTimeout(() => process.exit(0), 200).unref();
 }
@@ -5412,10 +6300,11 @@ process.on("SIGTERM", shutdown);
 process.on("unhandledRejection", (reason) => console.error("[order-flow-mcp] unhandled rejection:", reason instanceof Error ? reason.message : String(reason).slice(0, 300)));
 process.on("uncaughtException", (error) => console.error("[order-flow-mcp] uncaught exception:", error));
 if (!options.http) {
-  const server = createServer2(hub);
+  const server = createServer3(hub, extras);
   await server.connect(new StdioServerTransport());
   process.stdin.on("close", shutdown);
   console.error(`[order-flow-mcp] ${VERSION2} ready on stdio`);
+  if (options.screener) ensureScreener().catch((error) => console.error(`[order-flow-mcp] screener failed to start: ${error instanceof Error ? error.message : error}`));
 } else {
   const readBody = (req) => new Promise((resolve, reject) => {
     let data = "";
@@ -5444,7 +6333,8 @@ if (!options.http) {
     if (url.pathname === "/health") {
       return send(res, 200, { ok: true, version: VERSION2, markets: hub.list().map((m) => m.spec.key) });
     }
-    if (url.pathname !== "/mcp") return send(res, 404, { error: "MCP endpoint is /mcp" });
+    if (screener.handle(req, res)) return;
+    if (url.pathname !== "/mcp") return send(res, 404, { error: "MCP endpoint is /mcp; the live screener is at /screener" });
     if (options.token && req.headers.authorization !== `Bearer ${options.token}`) {
       return send(res, 401, { error: "unauthorized" });
     }
@@ -5453,7 +6343,7 @@ if (!options.http) {
     }
     try {
       const body = await readBody(req);
-      const server = createServer2(hub);
+      const server = createServer3(hub, extras);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: void 0, enableJsonResponse: true });
       res.on("close", () => {
         void transport.close();
@@ -5467,5 +6357,6 @@ if (!options.http) {
   });
   http.listen(options.port, options.host, () => {
     console.error(`[order-flow-mcp] ${VERSION2} listening on http://${options.host}:${options.port}/mcp`);
+    console.error(`[order-flow-mcp] live screener at ${screenerUrl2(options.host, options.port, options.token)}`);
   });
 }

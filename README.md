@@ -131,6 +131,8 @@ npm run inspect          # MCP Inspector UI
 | `get_venue_comparison` | Each venue's price premium, volume share and delta, and which exchange leads price (in ms) |
 | `get_liquidity_heatmap` | Resting depth over time within ±1 % of mid, with persistent walls marked pulled, added or held |
 | `scan_markets` | Screener: rank up to 15 symbols by volume z-score, delta, buy %, VWAP stretch, OI change, liquidations… |
+| `open_screener` | Opens the **live screener** page for the user (see below) and returns its URL |
+| `wait_for` | Blocks until a condition fires on up to 10 markets (price level, % move, **liquidation cascade**, liquidation total, single print ≥ $N, absorption, iceberg) or times out, so the agent reacts in under a second instead of polling |
 | `watch_markets` / `unwatch_market` / `list_active_markets` | Add markets to the watchlist, stop one, or see what is streaming and for how long |
 | `list_markets` | The 120+ supported assets, which venues list each one, and timeframes |
 
@@ -139,6 +141,28 @@ There is also an `analyze_order_flow` prompt (a slash command in clients that su
 Every market tool takes `symbol` (`"BTC"`, `"eth"`, `"SOL-PERP"`, `"DOGEUSDT"`…), plus optional `venue`
 (default `"all"`, or one of `binance`, `bybit`, `okx`, `bitget`, `hyperliquid`, `deribit`, `coinbase`, `gate`,
 `kucoin`, `kraken`, `htx`) and `market_type` (`perp` by default, or `spot`).
+
+### Live screener
+
+`open_screener` opens a watchlist page in your browser. Every market the server is streaming is on it, and
+it updates as trades arrive:
+
+- price (the median of each venue's latest print) 4 times a second, with changed digits flashing green or red
+- a sparkline with a dashed baseline and a change pill (tap it to switch between % and price) over 15m, 1h,
+  4h or the whole session
+- per-market order-flow chips: 5m delta and buy %, book imbalance, funding, 5m OI change, 5m long/short
+  liquidations, volume z-score and VWAP stretch, plus a blinking **LIQ CASCADE** badge
+- a live tape of notable events: big prints, absorption, icebergs and large liquidations
+
+The page reads from the same streams as the agent, so you and the agent see the same data. Ask for markets
+by name ("open the screener with BTC, ETH, SOL and DOGE") and they are added. Over stdio the page is served on
+`http://127.0.0.1:3334/screener` (or the next free port), and starts on the first `open_screener` call or at
+startup with `--screener`. Over `--http` it is at `/screener` on the same port (add `?token=` when a token is set).
+JSON for your own tools: `/screener/data.json?window=1h`, or the Server-Sent Events stream at `/screener/stream`.
+
+To have the agent keep watch, ask it to use `wait_for`, e.g. "wait for a liquidation cascade on the BTC perp
+and tell me when it happens". Each call waits up to `timeout_seconds` (default 300) and the agent calls it
+again to keep watching.
 
 ### Coverage
 
@@ -192,6 +216,8 @@ the agent's context.
 | `--watch BTC,ETH` | `ORDERFLOW_WATCH` | `BTC,ETH,SOL` | Markets that stream from startup and are never closed; `none` for no watchlist |
 | `--idle-minutes` | `ORDERFLOW_IDLE_MINUTES` | `0` (never) | Close markets outside the watchlist after this much idle time |
 | `--max-markets` | `ORDERFLOW_MAX_MARKETS` | `20` | Upper bound on concurrent markets |
+| `--screener` | `ORDERFLOW_SCREENER=1` | off | Start the live screener page at startup (stdio) instead of on the first `open_screener` call |
+| `--screener-port` | `ORDERFLOW_SCREENER_PORT` | `3334` | Screener port in stdio mode (the next free port is used if taken) |
 | | `HTTPS_PROXY` / `ORDERFLOW_PROXY` | – | Send exchange WebSockets and REST calls through an HTTP(S) proxy |
 
 To pass env vars from a client config, add `"env": { "ORDERFLOW_WATCH": "BTC,ETH" }` next to `command`.

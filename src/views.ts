@@ -94,8 +94,11 @@ export function connectionsView(market: LiveMarket) {
  * any venue jumps between those levels; the median does not. `print` is the
  * newest print itself (any venue). Venues silent for over a minute are ignored.
  */
-export function referenceLast(market: LiveMarket): { price: number; print: number; printVenue: Venue; venues: number } | null {
-  const tape = market.manager.getTapeLog(); // newest first
+export function referenceLast(
+  market: LiveMarket,
+  /** Newest first. The store's last 500 prints are much cheaper than the full tape for frequent callers. */
+  tape = market.manager.getTapeLog()
+): { price: number; print: number; printVenue: Venue; venues: number } | null {
   if (!tape.length) return null;
   const wanted = market.spec.venues.length;
   const cutoff = tape[0].timestamp - 60_000;
@@ -805,3 +808,55 @@ export function heatmapView(market: LiveMarket, minutes: number, rows: number, c
 }
 
 export { pct };
+
+// ─── screener row ─────────────────────────────────────────────
+/** True when the last minute's liquidations are ≥ $100K and ≥5× the median non-empty minute of the window. */
+export function cascadeNow(market: LiveMarket, windowMinutes = 30): boolean {
+  if (market.spec.marketType !== "perpetual") return false;
+  const buckets = bucketLiquidations(market.state.liquidations, 60_000, windowMinutes, now(market));
+  return isLiquidationCascade(buckets, 5, 100_000);
+}
+
+/** One market's screener row (scan_markets and the live screener page). */
+export function scanRow(m: LiveMarket, last = referenceLast(m)?.price) {
+  const s = m.state;
+  const t = s.marketClock || Date.now();
+  const w5 = flowWindow(m, 5 * 60_000);
+  const sigma = sigmaFromVwapOf(m);
+  const bars = s.flowBars;
+  let volumeZ: number | null = null;
+  if (bars.length > 120) {
+    // last completed minute vs the previous 20 minutes
+    const minutes = new Map<number, number>();
+    for (const b of bars) minutes.set(Math.floor(b.time / 60_000), (minutes.get(Math.floor(b.time / 60_000)) ?? 0) + b.volume);
+    const vols = [...minutes.values()];
+    const lastVolume = vols[vols.length - 2];
+    const base = vols.slice(Math.max(0, vols.length - 22), -2);
+    if (base.length >= 3 && lastVolume !== undefined) {
+      const mean = base.reduce((a, b) => a + b, 0) / base.length;
+      const sd = Math.sqrt(base.reduce((a, b) => a + (b - mean) ** 2, 0) / (base.length - 1));
+      volumeZ = sd > 0 ? (lastVolume - mean) / sd : 0;
+    }
+  }
+  const oi5 = oiWindowChange(s.oiHistory, 5 * 60_000);
+  const liq = summarizeLiquidations(s.liquidations, t - 5 * 60_000);
+  return {
+    symbol: m.spec.symbol,
+    ready: m.ready,
+    stream_age_s: Math.round(m.ageMs / 1000),
+    last: sig(last, 8),
+    change_5m_pct: w5?.price_change_pct ?? null,
+    delta_5m: w5?.delta ?? null,
+    buy_pct_5m: w5?.buy_pct ?? null,
+    notional_5m_usd: w5 ? Math.round(w5.notional_raw) : null,
+    volume_z_1m: fixed(volumeZ, 2),
+    sigma_from_vwap: fixed(sigma, 2),
+    obi: m.ready ? fixed(s.currentOBI, 2) : null,
+    funding_8h_pct: pct(s.derivatives?.fundingRate8h ?? null, 4),
+    oi_change_5m_pct: oi5 ? pct(oi5.oiChange) : null,
+    oi_regime_5m: oi5?.regime ?? null,
+    liquidations_5m_usd: Math.round(liq.longNotional + liq.shortNotional),
+    big_prints_5m: s.bigTrades.filter((b) => b.timestamp >= t - 5 * 60_000).length,
+    live_venues: m.connections().filter((c) => c.status === "live").length + "/" + m.spec.venues.length,
+  };
+}
