@@ -1,7 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ALL_ASSETS } from "@/lib/config/instruments";
-import { FOREX_SYMBOLS } from "@/lib/config/venues";
 import { oiWindowChange, summarizeLiquidations } from "@/lib/engine/derivatives";
 import type { Timeframe, Venue } from "@/lib/types/market";
 import { MarketHub, type LiveMarket } from "./market";
@@ -42,9 +41,9 @@ How to use:
 
 Important: data is live and in-memory. A market starts streaming the first time it is requested, so all session statistics cover only the time since streaming began (see stream_age_s; warming_up=true for the first minute). Call watch_markets early for markets you will analyze later, and wait before drawing conclusions from a young stream. This is market data for analysis only; it cannot place orders.`;
 
-const symbolArg = z.string().describe('Asset or symbol, e.g. "BTC", "ETHUSDT", "SOL-PERP", or an FX pair like "EUR/USD".');
+const symbolArg = z.string().describe('Asset or symbol, e.g. "BTC", "ETHUSDT", "SOL-PERP".');
 const venueArg = z.string().optional().describe('"all" (default, aggregate every venue listing the market) or one exchange: binance, bybit, okx, bitget, hyperliquid, deribit, coinbase, gate, kucoin, kraken, htx.');
-const marketTypeArg = z.enum(["perp", "perpetual", "spot", "forex"]).optional().describe('"perp" (default), "spot", or "forex".');
+const marketTypeArg = z.enum(["perp", "perpetual", "spot"]).optional().describe('"perp" (default) or "spot".');
 const waitArg = z.number().min(0).max(30).optional().describe("Seconds to wait for first data when a market is not streaming yet (default 10).");
 const marketArgs = { symbol: symbolArg, venue: venueArg, market_type: marketTypeArg, wait_seconds: waitArg };
 
@@ -87,7 +86,7 @@ export function createServer(hub: MarketHub): McpServer {
 
   server.registerTool("list_markets", {
     title: "List markets",
-    description: "Supported assets, which exchanges list each as perpetual or spot, FX pairs, and timeframes. Filter with query (e.g. 'sol', 'meme').",
+    description: "Supported crypto assets (plus gold and silver perpetuals), which exchanges list each as perpetual or spot, and timeframes. Filter with query (e.g. 'sol', 'meme').",
     inputSchema: { query: z.string().optional().describe("Case-insensitive filter on ticker or name."), limit: z.number().int().min(1).max(500).optional() },
     annotations: { readOnlyHint: true },
   }, async ({ query, limit }) => {
@@ -97,8 +96,6 @@ export function createServer(hub: MarketHub): McpServer {
       count: assets.length,
       columns: ["symbol", "name", "kind", "perp_venues", "spot_venues"],
       assets: assets.slice(0, limit ?? 200).map((a) => [`${a.base}USDT`, a.name, a.kind, a.perp.join(","), a.spot.join(",")]),
-      forex_pairs: FOREX_SYMBOLS,
-      forex_note: "FX needs FINNHUB_API_KEY in the server environment; FX quotes have no aggressor side or real depth.",
       perp_venues: PERP_VENUES,
       spot_venues: SPOT_VENUES,
       timeframes: TIMEFRAMES,
