@@ -10,12 +10,7 @@ describe("normalizeSymbol", () => {
     ["sol_usdc", "SOLUSDT"],
     ["DOGEUSDT", "DOGEUSDT"],
   ])("%s → %s", (raw, symbol) => {
-    expect(normalizeSymbol(raw)).toEqual({ symbol, forex: false });
-  });
-
-  it("recognises FX pairs", () => {
-    expect(normalizeSymbol("eurusd")).toEqual({ symbol: "EUR/USD", forex: true });
-    expect(normalizeSymbol("GBP/USD")).toEqual({ symbol: "GBP/USD", forex: true });
+    expect(normalizeSymbol(raw)).toBe(symbol);
   });
 });
 
