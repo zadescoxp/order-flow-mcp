@@ -21,7 +21,9 @@ import {
   microView,
   orderBookView,
   pct,
+  referenceLast,
   sig,
+  sigmaFromVwapOf,
   snapshotView,
   tradesView,
   venuesView,
@@ -271,7 +273,7 @@ export function createServer(hub: MarketHub): McpServer {
       const t = s.marketClock || Date.now();
       const w5 = flowWindow(m, 5 * 60_000);
       const session = s.session;
-      const sigma = session && session.vwapStd > 0 ? (session.last - session.vwap) / session.vwapStd : null;
+      const sigma = sigmaFromVwapOf(m);
       const bars = s.flowBars;
       let volumeZ: number | null = null;
       if (bars.length > 120) {
@@ -293,7 +295,7 @@ export function createServer(hub: MarketHub): McpServer {
         symbol: m.spec.symbol,
         ready: m.ready,
         stream_age_s: Math.round(m.ageMs / 1000),
-        last: session?.last ?? null,
+        last: sig(referenceLast(m)?.price, 8),
         change_5m_pct: w5?.price_change_pct ?? null,
         delta_5m: w5?.delta ?? null,
         buy_pct_5m: w5?.buy_pct ?? null,
@@ -383,7 +385,7 @@ export function createServer(hub: MarketHub): McpServer {
       stream_age_s: Math.round(m.ageMs / 1000),
       idle_s: Math.round((Date.now() - m.lastAccess) / 1000),
       trades: m.state.session?.trades ?? 0,
-      last: m.state.session?.last ?? null,
+      last: sig(referenceLast(m)?.price, 8),
       connections: connectionsView(m),
     })),
   }));
